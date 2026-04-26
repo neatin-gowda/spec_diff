@@ -1,19 +1,15 @@
 """
-FastAPI app — orchestrates upload, extraction, diff, and queries.
+FastAPI app — orchestrates upload, extraction, diff, reports, and queries.
 
 Endpoints:
-  POST /compare              upload two PDFs, run the full pipeline
-  GET  /runs/{run_id}        status + stats
-  GET  /runs/{run_id}/diff   list of block diffs (filterable)
-  GET  /runs/{run_id}/summary the Feature/Change/Clarify table
-  POST /runs/{run_id}/query  NL query against the diff
-  GET  /runs/{run_id}/pages/{side}/{n}  rendered page image (for viewer)
-  GET  /runs/{run_id}/overlay/{side}/{n}  overlay regions for a page
-
-In production these write to Postgres + Blob Storage.
-For the reference impl we keep state in-memory keyed by run_id, which
-is fine for a single-node demo and trivial to swap for the DB-backed
-version (the swap point is `_RUNS` -> a repository class).
+  POST /compare                         upload two PDFs, run the full pipeline
+  GET  /runs/{run_id}                   status + stats
+  GET  /runs/{run_id}/diff              list of block diffs
+  GET  /runs/{run_id}/summary           review summary rows
+  POST /runs/{run_id}/query             NL query against the diff
+  GET  /runs/{run_id}/report.pdf        downloadable PDF report
+  GET  /runs/{run_id}/pages/{side}/{n}  rendered page image
+  GET  /runs/{run_id}/overlay/{side}/{n} overlay regions for a page
 """
 from __future__ import annotations
 
@@ -26,7 +22,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .differ_v2 import diff_blocks, diff_stats
@@ -37,6 +33,7 @@ from .models import (
     ChangeType,
 )
 from .query import query as nl_query
+from .report import build_pdf_report
 from .summarizer import summarize
 
 
@@ -50,7 +47,7 @@ app.add_middleware(
 )
 
 
-_RUNS: dict[str, dict] = {}    # in-memory store; swap for Postgres in prod
+_RUNS: dict[str, dict] = {}
 
 
 class CompareResponse(BaseModel):
@@ -73,13 +70,29 @@ async def compare(
     base_pdf = work / "base.pdf"
     target_pdf = work / "target.pdf"
 
+    _RUNS[run_id] = {
+        "status": "running",
+        "status_message": "Preparing uploaded documents",
+        "progress": 5,
+    }
+
     with base_pdf.open("wb") as f:
         shutil.copyfileobj(base.file, f)
     with target_pdf.open("wb") as f:
         shutil.copyfileobj(target.file, f)
 
+    _RUNS[run_id].update({
+        "status_message": "Reading pages",
+        "progress": 15,
+    })
+
     base_imgs = render_pages(str(base_pdf), str(work / "pages_base"))
     target_imgs = render_pages(str(target_pdf), str(work / "pages_target"))
+
+    _RUNS[run_id].update({
+        "status_message": "Finding sections and tables",
+        "progress": 35,
+    })
 
     base_blocks = extract_blocks(str(base_pdf))
     target_blocks = extract_blocks(str(target_pdf))
@@ -87,12 +100,25 @@ async def compare(
     cov_b = coverage_pct(str(base_pdf), base_blocks)
     cov_t = coverage_pct(str(target_pdf), target_blocks)
 
+    _RUNS[run_id].update({
+        "status_message": "Comparing changes",
+        "progress": 60,
+    })
+
     diffs = diff_blocks(base_blocks, target_blocks)
     stats = diff_stats(diffs)
+
+    _RUNS[run_id].update({
+        "status_message": "Preparing review summary",
+        "progress": 78,
+    })
 
     summary = summarize(diffs, base_blocks, target_blocks, use_llm=use_llm)
 
     _RUNS[run_id] = {
+        "status": "complete",
+        "status_message": "Comparison complete",
+        "progress": 100,
         "work": work,
         "base_pdf": base_pdf,
         "target_pdf": target_pdf,
@@ -120,14 +146,18 @@ def run_meta(run_id: str):
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+
     return {
         "run_id": run_id,
-        "base_label": r["base_label"],
-        "target_label": r["target_label"],
-        "stats": r["stats"],
-        "coverage": r["coverage"],
-        "n_pages_base": len(r["base_imgs"]),
-        "n_pages_target": len(r["target_imgs"]),
+        "status": r.get("status", "complete"),
+        "status_message": r.get("status_message", "Comparison complete"),
+        "progress": r.get("progress", 100),
+        "base_label": r.get("base_label"),
+        "target_label": r.get("target_label"),
+        "stats": r.get("stats", {}),
+        "coverage": r.get("coverage", {}),
+        "n_pages_base": len(r.get("base_imgs", [])),
+        "n_pages_target": len(r.get("target_imgs", [])),
     }
 
 
@@ -142,6 +172,8 @@ def get_diff(
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
 
     base_by_id = {b.id: b for b in r["base_blocks"]}
     target_by_id = {b.id: b for b in r["target_blocks"]}
@@ -190,7 +222,30 @@ def get_summary(run_id: str):
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+
     return {"summary": [s.dict() for s in r["summary"]]}
+
+
+@app.get("/runs/{run_id}/report.pdf")
+def get_report_pdf(run_id: str):
+    r = _RUNS.get(run_id)
+    if not r:
+        raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+
+    pdf_bytes = build_pdf_report(run_id, r)
+    filename = f"spec_diff_report_{run_id}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
 
 
 class QueryReq(BaseModel):
@@ -202,8 +257,21 @@ def post_query(run_id: str, req: QueryReq):
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
-    rows = nl_query(req.question, r["diffs"], r["base_blocks"], r["target_blocks"])
-    return {"rows": rows[:200], "count": len(rows)}
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+
+    result = nl_query(req.question, r["diffs"], r["base_blocks"], r["target_blocks"])
+
+    # query.py now returns a dict. Keep backward safety if older query.py returns a list.
+    if isinstance(result, dict):
+        return result
+
+    return {
+        "answer": f"I found {len(result)} matching changes.",
+        "rows": result[:200],
+        "count": len(result),
+        "plan": {},
+    }
 
 
 @app.get("/runs/{run_id}/pages/{side}/{n}")
@@ -239,20 +307,11 @@ def _page_dimensions_for(blocks: list[Block], page_number: int) -> tuple[Optiona
 
 @app.get("/runs/{run_id}/overlay/{side}/{n}")
 def get_overlay(run_id: str, side: str, n: int):
-    """
-    Returns rectangles to draw on top of the page image to show
-    ADDED (green), DELETED (red), MODIFIED (yellow) regions.
-
-    Important:
-    - ADDED appears only on target/current side.
-    - DELETED appears only on base/previous side.
-    - MODIFIED appears on both sides.
-    - TABLE blocks are skipped when row-level TABLE_ROW blocks exist, because
-      otherwise one row-level change can paint the entire table.
-    """
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
     if side not in ("base", "target"):
         raise HTTPException(400, "side must be base|target")
 
@@ -325,8 +384,12 @@ def get_overlay(run_id: str, side: str, n: int):
 @app.get("/")
 def root():
     return {"status": "ok", "name": "spec-diff", "endpoints": [
-        "POST /compare", "GET /runs/{id}", "GET /runs/{id}/diff",
-        "GET /runs/{id}/summary", "POST /runs/{id}/query",
+        "POST /compare",
+        "GET /runs/{id}",
+        "GET /runs/{id}/diff",
+        "GET /runs/{id}/summary",
+        "GET /runs/{id}/report.pdf",
+        "POST /runs/{id}/query",
         "GET /runs/{id}/pages/{side}/{n}",
         "GET /runs/{id}/overlay/{side}/{n}",
         "POST /runs/{id}/compare-tables",
@@ -341,14 +404,11 @@ class CompareTablesReq(BaseModel):
 
 @app.post("/runs/{run_id}/compare-tables")
 def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
-    """
-    Header-to-header comparison: pick any table by header text on the
-    base side, any table on the target side, and diff their rows.
-    Aligned by stable_key when present. Cross-page-spanning tables OK.
-    """
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
 
     from .differ_v2 import compare_table_headers
 
@@ -362,11 +422,11 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
 
 @app.get("/runs/{run_id}/tables")
 def list_tables(run_id: str):
-    """List every detected table on each side, with header preview, so the UI
-    can offer a dropdown for header-to-header comparison."""
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
 
     def _summarize(blocks):
         out = []
