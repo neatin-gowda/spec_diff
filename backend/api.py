@@ -70,20 +70,21 @@ async def compare(
 
     run_id = str(uuid.uuid4())
     work = Path(tempfile.mkdtemp(prefix=f"specdiff_{run_id}_"))
-    base_pdf   = work / "base.pdf"
+    base_pdf = work / "base.pdf"
     target_pdf = work / "target.pdf"
+
     with base_pdf.open("wb") as f:
         shutil.copyfileobj(base.file, f)
     with target_pdf.open("wb") as f:
         shutil.copyfileobj(target.file, f)
 
-    base_imgs   = render_pages(str(base_pdf),   str(work / "pages_base"))
+    base_imgs = render_pages(str(base_pdf), str(work / "pages_base"))
     target_imgs = render_pages(str(target_pdf), str(work / "pages_target"))
 
-    base_blocks   = extract_blocks(str(base_pdf))
+    base_blocks = extract_blocks(str(base_pdf))
     target_blocks = extract_blocks(str(target_pdf))
 
-    cov_b = coverage_pct(str(base_pdf),   base_blocks)
+    cov_b = coverage_pct(str(base_pdf), base_blocks)
     cov_t = coverage_pct(str(target_pdf), target_blocks)
 
     diffs = diff_blocks(base_blocks, target_blocks)
@@ -95,17 +96,18 @@ async def compare(
         "work": work,
         "base_pdf": base_pdf,
         "target_pdf": target_pdf,
-        "base_label":   Path(base.filename).stem,
+        "base_label": Path(base.filename).stem,
         "target_label": Path(target.filename).stem,
-        "base_imgs":   base_imgs,
+        "base_imgs": base_imgs,
         "target_imgs": target_imgs,
-        "base_blocks":   base_blocks,
+        "base_blocks": base_blocks,
         "target_blocks": target_blocks,
-        "diffs":  diffs,
-        "stats":  stats,
+        "diffs": diffs,
+        "stats": stats,
         "summary": summary,
         "coverage": {"base": cov_b, "target": cov_t},
     }
+
     return CompareResponse(
         run_id=run_id,
         stats=stats,
@@ -120,11 +122,11 @@ def run_meta(run_id: str):
         raise HTTPException(404, "no such run")
     return {
         "run_id": run_id,
-        "base_label":   r["base_label"],
+        "base_label": r["base_label"],
         "target_label": r["target_label"],
-        "stats":   r["stats"],
+        "stats": r["stats"],
         "coverage": r["coverage"],
-        "n_pages_base":   len(r["base_imgs"]),
+        "n_pages_base": len(r["base_imgs"]),
         "n_pages_target": len(r["target_imgs"]),
     }
 
@@ -141,39 +143,45 @@ def get_diff(
     if not r:
         raise HTTPException(404, "no such run")
 
-    base_by_id   = {b.id: b for b in r["base_blocks"]}
+    base_by_id = {b.id: b for b in r["base_blocks"]}
     target_by_id = {b.id: b for b in r["target_blocks"]}
     out = []
+
     for d in r["diffs"]:
         if change_type and d.change_type.value != change_type.upper():
             continue
+
         b = base_by_id.get(d.base_block_id) if d.base_block_id else None
         t = target_by_id.get(d.target_block_id) if d.target_block_id else None
         block = b or t
+
         if not block:
             continue
         if section and section.lower() not in (block.path or "").lower():
             continue
         if stable_key and (block.stable_key or "").upper() != stable_key.upper():
             continue
+
         out.append({
             "change_type": d.change_type.value,
             "stable_key": block.stable_key,
             "block_type": block.block_type.value,
             "path": block.path,
-            "page_base":   b.page_number if b else None,
+            "page_base": b.page_number if b else None,
             "page_target": t.page_number if t else None,
             "before": b.text if b else None,
-            "after":  t.text if t else None,
+            "after": t.text if t else None,
             "field_diffs": [fd.dict() for fd in d.field_diffs],
-            "token_diff":  [td.dict() for td in d.token_diff],
+            "token_diff": [td.dict() for td in d.token_diff],
             "similarity": d.similarity,
-            "impact":     d.impact_score,
-            "bbox_base":   b.bbox if b else None,
+            "impact": d.impact_score,
+            "bbox_base": b.bbox if b else None,
             "bbox_target": t.bbox if t else None,
         })
+
         if len(out) >= limit:
             break
+
     return {"diffs": out, "count": len(out)}
 
 
@@ -205,10 +213,28 @@ def get_page(run_id: str, side: str, n: int):
         raise HTTPException(404, "no such run")
     if side not in ("base", "target"):
         raise HTTPException(400, "side must be base|target")
+
     imgs = r["base_imgs"] if side == "base" else r["target_imgs"]
     if n < 1 or n > len(imgs):
         raise HTTPException(404, "page out of range")
+
     return FileResponse(imgs[n - 1], media_type="image/png")
+
+
+def _page_dimensions_for(blocks: list[Block], page_number: int) -> tuple[Optional[float], Optional[float]]:
+    for block in blocks:
+        if block.page_number != page_number:
+            continue
+        if not isinstance(block.payload, dict):
+            continue
+
+        page_width = block.payload.get("page_width")
+        page_height = block.payload.get("page_height")
+
+        if page_width and page_height:
+            return page_width, page_height
+
+    return None, None
 
 
 @app.get("/runs/{run_id}/overlay/{side}/{n}")
@@ -216,39 +242,54 @@ def get_overlay(run_id: str, side: str, n: int):
     """
     Returns rectangles to draw on top of the page image to show
     ADDED (green), DELETED (red), MODIFIED (yellow) regions.
+
+    Important:
+    - ADDED appears only on target/current side.
+    - DELETED appears only on base/previous side.
+    - MODIFIED appears on both sides.
+    - TABLE blocks are skipped when row-level TABLE_ROW blocks exist, because
+      otherwise one row-level change can paint the entire table.
     """
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
-    base_by_id   = {b.id: b for b in r["base_blocks"]}
+    if side not in ("base", "target"):
+        raise HTTPException(400, "side must be base|target")
+
+    base_by_id = {b.id: b for b in r["base_blocks"]}
     target_by_id = {b.id: b for b in r["target_blocks"]}
+    side_blocks = r["base_blocks"] if side == "base" else r["target_blocks"]
+
+    page_width, page_height = _page_dimensions_for(side_blocks, n)
 
     color_map = {
-        "ADDED":    "rgba(40,180,40,0.30)",
-        "DELETED":  "rgba(220,40,40,0.30)",
+        "ADDED": "rgba(40,180,40,0.30)",
+        "DELETED": "rgba(220,40,40,0.30)",
         "MODIFIED": "rgba(220,200,40,0.30)",
     }
+
     regions = []
+
     for d in r["diffs"]:
         if d.change_type == ChangeType.UNCHANGED:
             continue
+
         if side == "base":
             blk = base_by_id.get(d.base_block_id) if d.base_block_id else None
             if not blk or blk.page_number != n:
                 continue
             if d.change_type == ChangeType.ADDED:
-                continue       # ADDED has no base block
+                continue
         else:
             blk = target_by_id.get(d.target_block_id) if d.target_block_id else None
             if not blk or blk.page_number != n:
                 continue
             if d.change_type == ChangeType.DELETED:
-                continue       # DELETED has no target block
+                continue
 
         if not blk.bbox:
             continue
 
-        side_blocks = r["base_blocks"] if side == "base" else r["target_blocks"]
         has_row_children = any(
             c.parent_id == blk.id and c.block_type.value == "table_row"
             for c in side_blocks
@@ -256,17 +297,29 @@ def get_overlay(run_id: str, side: str, n: int):
         if blk.block_type.value == "table" and has_row_children:
             continue
 
+        region_page_width = None
+        region_page_height = None
+        if isinstance(blk.payload, dict):
+            region_page_width = blk.payload.get("page_width")
+            region_page_height = blk.payload.get("page_height")
+
         regions.append({
             "bbox": blk.bbox,
             "change_type": d.change_type.value,
             "color": color_map[d.change_type.value],
             "stable_key": blk.stable_key,
             "block_type": blk.block_type.value,
-            "page_width": blk.payload.get("page_width") if isinstance(blk.payload, dict) else None,
-            "page_height": blk.payload.get("page_height") if isinstance(blk.payload, dict) else None,
-
+            "page_width": region_page_width or page_width,
+            "page_height": region_page_height or page_height,
         })
-    return {"page": n, "side": side, "regions": regions}
+
+    return {
+        "page": n,
+        "side": side,
+        "page_width": page_width,
+        "page_height": page_height,
+        "regions": regions,
+    }
 
 
 @app.get("/")
@@ -296,11 +349,14 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
-    # Use v2 differ for this endpoint
+
     from .differ_v2 import compare_table_headers
+
     return compare_table_headers(
-        r["base_blocks"], r["target_blocks"],
-        req.base_header_query, req.target_header_query,
+        r["base_blocks"],
+        r["target_blocks"],
+        req.base_header_query,
+        req.target_header_query,
     )
 
 
@@ -311,11 +367,13 @@ def list_tables(run_id: str):
     r = _RUNS.get(run_id)
     if not r:
         raise HTTPException(404, "no such run")
+
     def _summarize(blocks):
         out = []
         for b in blocks:
             if b.block_type.value != "table":
                 continue
+
             header = b.payload.get("header", []) if isinstance(b.payload, dict) else []
             spans = b.payload.get("spans_pages", [b.page_number]) if isinstance(b.payload, dict) else [b.page_number]
             n_rows = sum(
@@ -323,6 +381,7 @@ def list_tables(run_id: str):
                 if c.parent_id == b.id and c.block_type.value == "table_row"
             )
             preview = " | ".join(str(h)[:40] for h in header[:6])
+
             out.append({
                 "id": str(b.id),
                 "page_first": b.page_number,
@@ -331,8 +390,10 @@ def list_tables(run_id: str):
                 "n_rows": n_rows,
                 "header_preview": preview,
             })
+
         return out
+
     return {
-        "base":   _summarize(r["base_blocks"]),
+        "base": _summarize(r["base_blocks"]),
         "target": _summarize(r["target_blocks"]),
     }
