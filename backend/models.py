@@ -96,9 +96,41 @@ class BlockDiff(BaseModel):
 
 
 class SummaryRow(BaseModel):
+    """
+    Generic review/report row.
+
+    The first three fields preserve the original UI contract:
+      feature | change | seek_clarification
+
+    The remaining fields make the summary useful across document types:
+    vehicle specs, contracts, RFPs, pricing docs, policies, compliance docs,
+    catalogs, operating procedures, etc.
+    """
     feature: str
     change: str
     seek_clarification: str
+
+    # Generic, reusable summary fields
+    area: Optional[str] = None                    # section/topic/business area
+    item: Optional[str] = None                    # item, clause, row, feature, term, requirement
+    change_type: Optional[str] = None             # ADDED | DELETED | MODIFIED
+    category: Optional[str] = None                # pricing, dates, availability, legal, table, wording, etc.
+    impact: Optional[str] = None                  # low | medium | high
+    confidence: Optional[float] = None            # 0..1
+
+    # Evidence and citations
+    before: Optional[str] = None
+    after: Optional[str] = None
+    citation: Optional[str] = None
+    page_base: Optional[int] = None
+    page_target: Optional[int] = None
+    stable_key: Optional[str] = None
+    block_type: Optional[str] = None
+    path: Optional[str] = None
+
+    # Review/report UX
+    needs_review: bool = False
+    review_reason: Optional[str] = None
 
 
 class ComparisonResult(BaseModel):
