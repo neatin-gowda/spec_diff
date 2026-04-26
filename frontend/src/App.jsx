@@ -59,6 +59,52 @@ const css = `
   @keyframes progress-shimmer {
     100% { transform: translateX(100%); }
   }
+  .grid-safe {
+    min-width: 0;
+  }
+  .table-selected-stack {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+    margin-bottom: 14px;
+    min-width: 0;
+  }
+  .table-preview-shell {
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .table-scroll-frame {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border: 1px solid #eee7dc;
+    border-radius: 8px;
+  }
+  .cell-wrap {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+  .cell-truncate {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  @media (max-width: 1200px) {
+    .table-picker-grid, .table-config-grid {
+      grid-template-columns: 1fr !important;
+    }
+  }
+  @media (max-width: 760px) {
+    .table-action-grid {
+      grid-template-columns: 1fr !important;
+    }
+    .table-action-grid button {
+      width: 100%;
+    }
+  }
   @media (max-width: 980px) {
     .upload-grid, .viewer-grid, .two-grid, .report-metrics, .table-picker-grid, .table-config-grid {
       grid-template-columns: 1fr !important;
@@ -1023,17 +1069,17 @@ function TablesWorkspace({ runId }) {
 
       {error && <ErrorBox message={error} />}
 
-      <div className="table-picker-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+      <div className="table-picker-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 14, marginBottom: 14 }}>
         <TablePicker title="Baseline document table" value={baseTableId} onChange={setBaseTableId} tables={baseTables} />
         <TablePicker title="Revised document table" value={targetTableId} onChange={setTargetTableId} tables={targetTables} />
       </div>
 
-      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+      <div className="table-picker-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 14, marginBottom: 14 }}>
         <TableInfo table={baseTable} emptyLabel="Select a baseline table to inspect its title, page, columns, and rows." />
         <TableInfo table={targetTable} emptyLabel="Select a revised table to inspect its title, page, columns, and rows." />
       </div>
 
-      <div className="table-config-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+      <div className="table-config-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 14, marginBottom: 14 }}>
         <ColumnConfig
           title="Baseline columns"
           table={baseTable}
@@ -1052,7 +1098,7 @@ function TablesWorkspace({ runId }) {
         />
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "end", marginBottom: 14 }}>
+      <div className="table-action-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "end", marginBottom: 14 }}>
         <div>
           <label style={labelStyle}>Optional row filter</label>
           <input
@@ -1073,7 +1119,7 @@ function TablesWorkspace({ runId }) {
 
       {viewBusy && <SoftLoading label="Rendering selected table values" />}
 
-      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+      <div className="table-selected-stack">
         <SelectedTableView title="Baseline selected view" view={baseView} />
         <SelectedTableView title="Revised selected view" view={targetView} />
       </div>
@@ -1122,10 +1168,12 @@ function TableInfo({ table, emptyLabel }) {
   const columns = table.columns || [];
 
   return (
-    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+    <div className="table-preview-shell" style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-        <div>
-          <div style={{ fontWeight: 650 }}>{table.title || table.area || "Detected table"}</div>
+        <div style={{ minWidth: 0 }}>
+          <div className="cell-truncate" title={table.title || table.area || "Detected table"} style={{ fontWeight: 650 }}>
+            {table.title || table.area || "Detected table"}
+          </div>
           <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>
             {table.page_label || `Page ${table.page_first || "-"}`} · {table.n_columns || columns.length} columns · {table.n_rows || 0} rows
           </div>
@@ -1139,14 +1187,14 @@ function TableInfo({ table, emptyLabel }) {
         </div>
       )}
 
-      <div style={{ marginTop: 10, color: "#475467", fontSize: 13 }}>
+      <div className="cell-wrap" style={{ marginTop: 10, color: "#475467", fontSize: 13 }}>
         <strong style={{ fontWeight: 650 }}>Columns:</strong> {columns.slice(0, 14).join(" | ") || "No columns detected"}
       </div>
 
       {Array.isArray(table.column_details) && table.column_details.length > 0 && (
         <div style={{ marginTop: 10, display: "flex", gap: 6, flexWrap: "wrap" }}>
           {table.column_details.slice(0, 14).map((col) => (
-            <span key={col.name} style={{ border: "1px solid #d8d0c3", borderRadius: 999, padding: "2px 7px", fontSize: 12, color: "#475467", background: "#fbfaf6" }}>
+            <span key={col.name} title={`${col.name}${col.sample_values?.[0] ? `: ${col.sample_values[0]}` : ""}`} style={{ border: "1px solid #d8d0c3", borderRadius: 999, padding: "2px 7px", fontSize: 12, color: "#475467", background: "#fbfaf6", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {col.name}
               {col.sample_values?.[0] ? `: ${trim(col.sample_values[0], 24)}` : ""}
             </span>
@@ -1167,7 +1215,7 @@ function ColumnConfig({ title, table, rowColumns, setRowColumns, valueColumns, s
   const columns = table.columns || [];
 
   return (
-    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+    <div className="table-preview-shell" style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
       <div style={{ fontWeight: 650, marginBottom: 10 }}>{title}</div>
 
       <MultiSelect
@@ -1213,14 +1261,14 @@ function MultiSelect({ label, helper, options, selected, onChange }) {
         </div>
       </div>
 
-      <div className="dl-scrollbar" style={{ maxHeight: 150, overflow: "auto", border: "1px solid #e0d8ca", borderRadius: 8, padding: 8, background: "#fbfaf6" }}>
+      <div className="dl-scrollbar" style={{ maxHeight: 150, overflow: "auto", border: "1px solid #e0d8ca", borderRadius: 8, padding: 8, background: "#fbfaf6", minWidth: 0 }}>
         {options.length === 0 ? (
           <div style={{ color: "#667085", fontSize: 13 }}>No columns available.</div>
         ) : (
           options.map((option) => (
-            <label key={option} style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 4px", fontSize: 13, color: "#344054" }}>
+            <label key={option} title={option} style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 4px", fontSize: 13, color: "#344054", minWidth: 0 }}>
               <input type="checkbox" checked={selected.includes(option)} onChange={() => toggle(option)} />
-              <span>{option}</span>
+              <span className="cell-truncate">{option}</span>
             </label>
           ))
         )}
@@ -1232,12 +1280,14 @@ function MultiSelect({ label, helper, options, selected, onChange }) {
 function TablePreview({ columns, rows }) {
   if (!columns.length || !rows.length) return null;
 
+  const minWidth = tableMinWidth(columns.length, 420, 920);
+
   return (
-    <div className="dl-scrollbar" style={{ marginTop: 12, overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 520 }}>
+    <div className="dl-scrollbar table-scroll-frame" style={{ marginTop: 12 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth }}>
         <thead>
           <tr style={{ background: "#f2eee6" }}>
-            {columns.map((col) => <th key={col} style={smallTh}>{col}</th>)}
+            {columns.map((col) => <th key={col} title={col} style={smallTh}>{col}</th>)}
           </tr>
         </thead>
         <tbody>
@@ -1256,11 +1306,11 @@ function SelectedTableView({ title, view }) {
   if (!view) return <EmptyState label={`${title}: select a table and columns to render values.`} />;
 
   return (
-    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+    <div className="table-preview-shell" style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 650 }}>{title}</div>
-          <div style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
+          <div className="cell-wrap" style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
             {view.title || view.table?.display_name || "Selected table"} · showing {view.count || 0} of {view.total_rows || 0} row(s)
           </div>
         </div>
@@ -1275,13 +1325,15 @@ function RenderedRowsTable({ columns, rows }) {
   if (!columns.length) return <EmptyState label="No columns selected." />;
   if (!rows.length) return <EmptyState label="No rows match the selected table/filter." />;
 
+  const minWidth = tableMinWidth(columns.length + 1, 560, 1280);
+
   return (
-    <div className="dl-scrollbar" style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 720 }}>
+    <div className="dl-scrollbar table-scroll-frame">
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth }}>
         <thead>
           <tr style={{ background: "#f2eee6", color: "#344054" }}>
             <th style={smallTh}>Row</th>
-            {columns.map((col) => <th key={col} style={smallTh}>{col}</th>)}
+            {columns.map((col) => <th key={col} title={col} style={smallTh}>{col}</th>)}
           </tr>
         </thead>
         <tbody>
@@ -1321,7 +1373,7 @@ function TableColumnCompareResult({ diff }) {
 
       {alignment.length > 0 && <ColumnAlignment alignment={alignment} />}
 
-      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14, marginBottom: 14 }}>
+      <div className="table-selected-stack" style={{ marginTop: 14 }}>
         <SelectedTableView title="Baseline compared values" view={diff.base_preview} />
         <SelectedTableView title="Revised compared values" view={diff.target_preview} />
       </div>
@@ -1583,6 +1635,11 @@ function displayCell(value) {
   return String(value);
 }
 
+function tableMinWidth(columnCount, min = 560, max = 1280) {
+  const count = Math.max(1, Number(columnCount) || 1);
+  return Math.min(max, Math.max(min, 180 + count * 180));
+}
+
 function trim(value, limit) {
   if (!value) return "";
   const text = String(value).replace(/\s+/g, " ").trim();
@@ -1651,12 +1708,18 @@ const smallTh = {
   padding: "8px 9px",
   borderBottom: "1px solid #ded6c8",
   fontWeight: 650,
+  verticalAlign: "top",
+  whiteSpace: "normal",
+  overflowWrap: "anywhere",
 };
 
 const smallTd = {
   padding: "8px 9px",
   borderBottom: "1px solid #eee7dc",
   verticalAlign: "top",
+  whiteSpace: "normal",
+  overflowWrap: "anywhere",
+  lineHeight: 1.35,
 };
 
 const miniButtonStyle = {
