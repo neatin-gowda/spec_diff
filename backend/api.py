@@ -163,6 +163,7 @@ def _persist_run_safely(
     coverage: dict,
     base_page_count: int,
     target_page_count: int,
+    enable_embeddings: bool = True,
 ) -> tuple[Optional[int], Optional[str]]:
     try:
         from .persistence import persist_run
@@ -186,6 +187,7 @@ def _persist_run_safely(
             coverage=coverage,
             base_page_count=base_page_count,
             target_page_count=target_page_count,
+            enable_embeddings=enable_embeddings,
         )
         return db_run_id, None
     except Exception:
@@ -254,6 +256,7 @@ def _process_compare(
             coverage=coverage,
             base_page_count=len(base_imgs),
             target_page_count=len(target_imgs),
+            enable_embeddings=use_llm,
         )
 
         _RUNS[run_id].update(
@@ -502,7 +505,13 @@ def get_report_pdf(run_id: str):
 def post_query(run_id: str, req: QueryReq):
     r = _ensure_complete(run_id)
 
-    result = nl_query(req.question, r["diffs"], r["base_blocks"], r["target_blocks"])
+    result = nl_query(
+        req.question,
+        r["diffs"],
+        r["base_blocks"],
+        r["target_blocks"],
+        db_run_id=r.get("db_run_id"),
+    )
 
     if isinstance(result, dict):
         return result
