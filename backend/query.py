@@ -23,6 +23,8 @@ from typing import Any, Optional
 
 from rapidfuzz import fuzz
 
+from .db import db_enabled, get_conn
+from .embeddings import embed_query, vector_literal
 from .models import Block, BlockDiff, ChangeType
 
 
@@ -789,6 +791,157 @@ def llm_plan(nl: str) -> Optional[dict]:
         return None
 
 
+def _semantic_search(nl: str, db_run_id: Optional[str], limit: int = 16) -> list[dict]:
+    if not db_run_id or not db_enabled():
+        return []
+
+    try:
+        vector = vector_literal(embed_query(nl))
+    except Exception:
+        return []
+
+    if not vector:
+        return []
+
+    try:
+        with get_conn() as conn:
+            found = conn.execute(
+                """
+                SELECT
+                    b.id,
+                    b.block_type,
+                    b.path,
+                    b.stable_key,
+                    b.page_number,
+                    b.text,
+                    b.payload,
+                    d.label AS document_label,
+                    CASE
+                        WHEN b.document_id = cr.base_doc_id THEN 'base'
+                        WHEN b.document_id = cr.target_doc_id THEN 'target'
+                        ELSE 'document'
+                    END AS side,
+                    1 - (b.embedding <=> %s::vector) AS similarity
+                FROM comparison_run cr
+                JOIN doc_block b
+                  ON b.document_id IN (cr.base_doc_id, cr.target_doc_id)
+                JOIN spec_document d
+                  ON d.id = b.document_id
+                WHERE cr.id = %s
+                  AND b.embedding IS NOT NULL
+                ORDER BY b.embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (vector, db_run_id, vector, limit),
+            ).fetchall()
+    except Exception:
+        return []
+
+    rows = []
+    for row in found:
+        side = row.get("side") or "document"
+        similarity = float(row.get("similarity") or 0)
+        text = _preview(row.get("text"), 520)
+        path = row.get("path")
+
+        rows.append(
+            {
+                "type": "semantic_match",
+                "source": "pgvector",
+                "change_type": "MATCH",
+                "stable_key": row.get("stable_key"),
+                "block_type": row.get("block_type"),
+                "path": path,
+                "area": _path_label(path),
+                "category": _infer_category(text or path or ""),
+                "page": row.get("page_number"),
+                "side": side,
+                "before": text if side == "base" else None,
+                "after": text if side == "target" else None,
+                "text": text,
+                "impact": similarity,
+                "confidence": round(max(0.35, min(0.98, similarity)), 2),
+                "citation": f"{side} p.{row.get('page_number')} - {_path_label(path)}",
+                "payload": row.get("payload") if isinstance(row.get("payload"), dict) else {},
+            }
+        )
+
+    return rows
+
+
+def _merge_rows(primary: list[dict], semantic: list[dict], limit: int = 200) -> list[dict]:
+    seen = set()
+    merged = []
+
+    for row in primary + semantic:
+        key = (
+            row.get("type"),
+            row.get("change_type"),
+            row.get("citation"),
+            row.get("before"),
+            row.get("after"),
+            row.get("text"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+
+    return merged[:limit]
+
+
+ANSWER_PROMPT = """\
+You are answering a business user's question about a PDF comparison.
+Use only the supplied evidence. Keep the answer direct and cite pages.
+If the user asks for a table, describe the rows/columns in a compact table-like format.
+
+Question:
+{question}
+
+Evidence JSON:
+{evidence}
+
+Output strict JSON:
+{{
+  "answer": "business-facing answer with citations",
+  "confidence": 0.0
+}}
+"""
+
+
+def llm_answer(nl: str, rows: list[dict]) -> Optional[str]:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    deploy = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+    if not (endpoint and api_key and deploy and rows):
+        return None
+
+    try:
+        from openai import AzureOpenAI
+
+        client = AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+        )
+        evidence = json.dumps(rows[:24], ensure_ascii=False, default=str)
+        resp = client.chat.completions.create(
+            model=deploy,
+            messages=[
+                {"role": "system", "content": "Output JSON only."},
+                {"role": "user", "content": ANSWER_PROMPT.format(question=nl, evidence=evidence)},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        answer = data.get("answer") if isinstance(data, dict) else None
+        return str(answer).strip() if answer else None
+    except Exception:
+        return None
+
+
 def _build_answer(question: str, rows: list[dict], plan: dict) -> str:
     if not rows:
         return "I could not find matching changes for that question in the extracted comparison."
@@ -832,6 +985,7 @@ def query(
     diffs: list[BlockDiff],
     base_blocks: list[Block],
     target_blocks: list[Block],
+    db_run_id: Optional[str] = None,
 ) -> dict:
     table_result = _table_query_answer(nl, base_blocks, target_blocks)
     if table_result is not None:
@@ -839,6 +993,7 @@ def query(
 
     plan = parse_query(nl)
     rows = execute_plan(plan, diffs, base_blocks, target_blocks)
+    semantic_rows = _semantic_search(nl, db_run_id)
 
     if not rows:
         llm = llm_plan(nl)
@@ -846,11 +1001,13 @@ def query(
             plan = llm
             rows = execute_plan(plan, diffs, base_blocks, target_blocks)
 
-    answer = _build_answer(nl, rows, plan)
+    rows = _merge_rows(rows, semantic_rows)
+    answer = llm_answer(nl, rows) or _build_answer(nl, rows, plan)
 
     return {
         "answer": answer,
         "rows": rows[:200],
         "count": len(rows),
         "plan": plan,
+        "semantic_matches": len(semantic_rows),
     }
