@@ -1,492 +1,803 @@
 """
-Three-layer extractor.
+Robust table extraction.
 
-Layer A:  PDF -> page images       (pdf -> PNG/JPEG via PyMuPDF)
-Layer B:  PDF -> word spans        (every word + bbox + page)
-Layer C:  PDF -> structured blocks (sections, tables, kv pairs, lists)
+The original extractor used pdfplumber.find_tables() with default settings.
+That is fast and reliable for clean grid tables, but misses:
 
-Layer C is the workhorse for semantic diffing. Layer B drives the
-visual highlight overlay. Layer A is pure rendering.
+  * Tables defined by whitespace/alignment alone (no ruling lines)
+  * Nested tables or merged cells
+  * Tables with rotated / vertical column headers
+  * Tables where the first extracted row is data, not a real header
 
-The extractor is INTENTIONALLY GENERIC. It does not hard-code any
-Ford-specific patterns. Where supplier-specific knowledge is needed
-(e.g., "rows that start with a 3-char alphanumeric code are stable
-keys"), the rules come from a TemplateProfile loaded from the DB.
+This module wraps multiple strategies and reconciles the results:
+
+  Strategy A: pdfplumber default (lines+text) - fastest, best for grids
+  Strategy B: pdfplumber text-only mode - catches whitespace tables
+  Strategy C: camelot stream mode - best for sparse tables
+
+The output contract is intentionally unchanged:
+    {page_num: [{"bbox": ..., "header": [...], "rows": [[...]], "strategy": "..."}]}
+
+Downstream extractor/stitcher/differ code can keep working.
 """
 from __future__ import annotations
 
-import hashlib
 import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, Optional
+import warnings
+from collections import defaultdict
+from typing import Any, Optional
 
-import fitz                                # PyMuPDF
 import pdfplumber
 
-from .models import Block, BlockType, TemplateProfile
+
+_GENERIC_COL_RE = re.compile(r"^col[_\s-]?\d+$", re.I)
+
+_SYMBOL_ONLY_VALUES = {
+    "",
+    "-",
+    "--",
+    "—",
+    "–",
+    ".",
+    "•",
+    "●",
+    "○",
+    "o",
+    "O",
+    "x",
+    "X",
+    "s",
+    "S",
+    "m",
+    "M",
+    "i",
+    "I",
+    "na",
+    "n/a",
+    "none",
+    "tbd",
+}
 
 
-# ---------------------------------------------------------------------
-#  Layer A — page images
-# ---------------------------------------------------------------------
-def render_pages(pdf_path: str, out_dir: str, dpi: int = 150) -> list[str]:
-    """Render every page to a PNG. Returns the list of paths."""
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    paths: list[str] = []
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
-    for i, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        p = out / f"page_{i:04d}.png"
-        pix.save(p)
-        paths.append(str(p))
-    doc.close()
-    return paths
+def _clean_cell(value: Any) -> str:
+    text = str(value or "")
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-# ---------------------------------------------------------------------
-#  Layer B — word spans
-# ---------------------------------------------------------------------
-@dataclass
-class Word:
-    page: int
-    text: str
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-    size: float = 0.0
-    fontname: str = ""
+def _clean_header(value: Any) -> str:
+    text = _clean_cell(value)
+    text = re.sub(r"\s*/\s*", " / ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:90].strip()
 
 
-def extract_words(pdf_path: str) -> list[Word]:
-    words: list[Word] = []
-    doc = fitz.open(pdf_path)
-    for pno, page in enumerate(doc, start=1):
-        for w in page.get_text("words"):
-            x0, y0, x1, y1, txt, *_ = w
-            if not txt.strip():
-                continue
-            words.append(Word(pno, txt, x0, y0, x1, y1))
-    doc.close()
-    return words
-
-
-# ---------------------------------------------------------------------
-#  Layer C — structured blocks
-# ---------------------------------------------------------------------
-@dataclass
-class _Line:
-    page: int
-    y: float
-    x0: float
-    x1: float
-    text: str
-    sizes: list[float] = field(default_factory=list)
-    fonts: list[str] = field(default_factory=list)
-
-    @property
-    def avg_size(self) -> float:
-        return sum(self.sizes) / len(self.sizes) if self.sizes else 0.0
-
-    @property
-    def is_bold(self) -> bool:
-        return any("Bold" in f or "Black" in f for f in self.fonts)
-
-
-def _collect_lines(pdf_path: str) -> list[_Line]:
-    """
-    Build a flat list of lines with font metadata. We use PyMuPDF for
-    font/style info (pdfplumber doesn't expose font weight cleanly).
-
-    Also filters out repeating page headers/footers (the boilerplate that
-    appears on every page — date stamps, "Ford Division", page numbers,
-    "PROPRIETARY"). These are pure noise for diffing.
-    """
-    raw: list[_Line] = []
-    doc = fitz.open(pdf_path)
-    page_height_by_num: dict[int, float] = {}
-    for pno, page in enumerate(doc, start=1):
-        page_height_by_num[pno] = page.rect.height
-        d = page.get_text("dict")
-        for block in d["blocks"]:
-            if block.get("type", 0) != 0:
-                continue
-            for line in block["lines"]:
-                if not line["spans"]:
-                    continue
-                txt = "".join(s["text"] for s in line["spans"]).strip()
-                if not txt:
-                    continue
-                spans = line["spans"]
-                raw.append(_Line(
-                    page=pno,
-                    y=line["bbox"][1],
-                    x0=line["bbox"][0],
-                    x1=line["bbox"][2],
-                    text=txt,
-                    sizes=[s["size"] for s in spans],
-                    fonts=[s["font"] for s in spans],
-                ))
-    doc.close()
-
-    if len(page_height_by_num) < 2:
-        return raw
-
-    # Identify lines that recur on >= 50% of pages near the top or bottom.
-    # These are page headers/footers and we drop them.
-    HEADER_BAND = 0.10        # top 10% of page
-    FOOTER_BAND = 0.92        # bottom 8% of page
-    text_to_pages: dict[str, set[int]] = {}
-    for ln in raw:
-        h = page_height_by_num[ln.page]
-        rel_y = ln.y / h
-        if rel_y <= HEADER_BAND or rel_y >= FOOTER_BAND:
-            text_to_pages.setdefault(ln.text, set()).add(ln.page)
-
-    page_count = len(page_height_by_num)
-    repeating = {
-        text
-        for text, pages in text_to_pages.items()
-        if len(pages) >= max(2, int(page_count * 0.4))
-    }
-
-    # Also drop pure date stamps, page-number-only lines, and "Ford Division"-style boilerplate
-    DATE_RX = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
-    PAGE_RX = re.compile(r"^-?\s*\d+\s*-?$")
-    BOILER  = {"Ford Division", "PROPRIETARY", "= New for this model year"}
-
-    filtered: list[_Line] = []
-    for ln in raw:
-        if ln.text in repeating:
-            continue
-        if DATE_RX.match(ln.text):
-            continue
-        if PAGE_RX.match(ln.text):
-            continue
-        if ln.text in BOILER:
-            continue
-        filtered.append(ln)
-
-    return filtered
-
-
-_HEADING_RE = re.compile(r"^[A-Z][A-Z0-9 /®™&\-\(\)\.]{2,}$")
-_STABLE_CODE_HINT = re.compile(r"\b(?:\(?[A-Z0-9]{2,4}\)?)\b")
-_TYPICAL_KEY_RE = re.compile(r"^\s*(?P<key>[A-Z][A-Za-z0-9 \-/®™&\.]+?):\s*(?P<val>.+)$")
-
-
-def _is_heading(line: _Line, body_size: float) -> bool:
-    """
-    Generic heading heuristic — works across templates because we look at
-    *relative* font size against the document body, not absolute sizes.
-    """
-    if line.avg_size > body_size * 1.15:
-        return True
-    if line.avg_size >= body_size and line.is_bold and _HEADING_RE.match(line.text):
-        return True
-    return False
-
-
-def _body_font_size(lines: list[_Line]) -> float:
-    """The mode of the size distribution = body font size."""
-    if not lines:
-        return 10.0
-    sizes: dict[float, int] = {}
-    for ln in lines:
-        s = round(ln.avg_size, 1)
-        sizes[s] = sizes.get(s, 0) + 1
-    return max(sizes.items(), key=lambda kv: kv[1])[0]
-
-
-def _hash_content(payload: dict) -> str:
-    """Stable hash that ignores key order."""
-    import json
-    s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _extract_tables(pdf_path: str) -> dict[int, list[dict]]:
-    """
-    pdfplumber tables, keyed by page. Each table includes its bbox so we
-    can later strip the lines that belong to it from the line stream.
-    """
-    by_page: dict[int, list[dict]] = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        for pno, page in enumerate(pdf.pages, start=1):
-            tables = page.find_tables()
-            entries = []
-            for t in tables:
-                rows = t.extract()
-                if not rows or len(rows) < 2:
-                    continue
-                # Try to identify a header row (first non-empty row)
-                header = next(
-                    (r for r in rows if any(c and c.strip() for c in r)),
-                    rows[0],
-                )
-                header = [c.strip() if c else "" for c in header]
-                body_rows: list[list[str]] = []
-                for r in rows:
-                    cleaned = [c.strip() if c else "" for c in r]
-                    if cleaned == header:
-                        continue
-                    if not any(cleaned):
-                        continue
-                    body_rows.append(cleaned)
-                entries.append({
-                    "bbox": t.bbox,
-                    "header": header,
-                    "rows": body_rows,
-                })
-            if entries:
-                by_page[pno] = entries
-    return by_page
-
-
-def _row_bbox_overlaps(line: _Line, table_bboxes: list[tuple[float, float, float, float]]) -> bool:
-    """True if line is inside any of the page's table bboxes (so we skip it for prose)."""
-    for x0, y0, x1, y1 in table_bboxes:
-        if y0 - 2 <= line.y <= y1 + 2 and x0 - 5 <= line.x0 and line.x1 <= x1 + 5:
-            return True
-    return False
-
-
-def extract_blocks(
-    pdf_path: str,
-    profile: Optional[TemplateProfile] = None,
-) -> list[Block]:
-    """
-    Produce a flat (parent-aware) sequence of Blocks.
-    Hierarchy is encoded in `path` and `parent_id`, not in nesting,
-    which keeps the SQL story simple.
-    """
-    lines = _collect_lines(pdf_path)
-    if not lines:
+def _normalize_rows(rows: list[list[Optional[str]]]) -> list[list[str]]:
+    if not rows:
         return []
 
-    body = _body_font_size(lines)
-    tables_by_page = _extract_tables(pdf_path)
+    n_cols = max(len(r) for r in rows)
+    out = []
 
-    # Build a per-page list of table bboxes for line filtering
-    table_bboxes_by_page: dict[int, list[tuple[float, float, float, float]]] = {
-        p: [t["bbox"] for t in tbls] for p, tbls in tables_by_page.items()
+    for row in rows:
+        normalized = [_clean_cell(c) for c in row]
+        normalized += [""] * (n_cols - len(normalized))
+        out.append(normalized)
+
+    return out
+
+
+def _forward_fill_rowspans(rows: list[list[Optional[str]]]) -> list[list[str]]:
+    """
+    pdfplumber returns None for cells covered by a rowspan-merged cell.
+    We forward-fill from the cell above so each row stands alone.
+    """
+    filled = _normalize_rows(rows)
+
+    if not filled:
+        return []
+
+    for ri in range(1, len(filled)):
+        for ci in range(len(filled[ri])):
+            if not filled[ri][ci] and filled[ri - 1][ci]:
+                filled[ri][ci] = filled[ri - 1][ci]
+
+    return filled
+
+
+def _is_sparse(rows: list[list[Optional[str]]]) -> float:
+    """Fraction of cells that are None/empty - signal of merged cells."""
+    if not rows:
+        return 0.0
+
+    total = sum(len(r) for r in rows)
+    empty = sum(1 for r in rows for c in r if c is None or c == "")
+
+    return empty / max(1, total)
+
+
+def _strategy_a(page) -> list[dict]:
+    """Default pdfplumber table extraction."""
+    out = []
+
+    for t in page.find_tables():
+        rows = t.extract()
+
+        if not rows or len(rows) < 2:
+            continue
+
+        rows = _normalize_rows(rows)
+        out.append({"bbox": t.bbox, "rows": rows, "strategy": "A"})
+
+    return out
+
+
+def _strategy_b(page) -> list[dict]:
+    """Text-only mode for whitespace-only tables."""
+    out = []
+    settings = {
+        "vertical_strategy": "text",
+        "horizontal_strategy": "text",
+        "intersection_tolerance": 5,
+        "snap_tolerance": 4,
+        "join_tolerance": 4,
+        "text_tolerance": 3,
     }
 
-    blocks: list[Block] = []
-    seq = 0
-    path_stack: list[str] = []
-    current_section_block: Optional[Block] = None
+    try:
+        tables = page.find_tables(table_settings=settings)
+    except Exception:
+        return out
 
-    # Emit table blocks first (we process them anchored on the first line that
-    # appears at-or-below the top of each table on each page)
-    emitted_table_pages: set[tuple[int, int]] = set()
+    for t in tables:
+        rows = t.extract()
 
-    def _slug(s: str) -> str:
-        s = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_").lower()
-        return s[:60] or "section"
+        if not rows or len(rows) < 2:
+            continue
 
-    def _emit_tables_for_page(pno: int):
-        if pno not in tables_by_page:
-            return
-        nonlocal seq
-        for ti, tbl in enumerate(tables_by_page[pno]):
-            key = (pno, ti)
-            if key in emitted_table_pages:
+        rows = _normalize_rows(rows)
+        out.append({"bbox": t.bbox, "rows": rows, "strategy": "B"})
+
+    return out
+
+
+def _strategy_c(pdf_path: str, page_num: int) -> list[dict]:
+    """Camelot stream mode - best for sparse / messy layouts."""
+    try:
+        import camelot
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ts = camelot.read_pdf(
+                pdf_path,
+                pages=str(page_num),
+                flavor="stream",
+                suppress_stdout=True,
+            )
+
+        out = []
+
+        for t in ts:
+            rows = t.df.fillna("").values.tolist()
+            rows = _normalize_rows(rows)
+
+            if len(rows) < 2:
                 continue
-            emitted_table_pages.add(key)
-            tbl_path = "/".join(path_stack + [f"table_{pno}_{ti}"])
-            parent_id = current_section_block.id if current_section_block else None
-            payload = {"header": tbl["header"], "rows": tbl["rows"]}
-            tblock = Block(
-                parent_id=parent_id,
-                block_type=BlockType.TABLE,
-                path="/" + tbl_path,
-                page_number=pno,
-                bbox=list(tbl["bbox"]),
-                text="",
-                payload=payload,
-                sequence=seq,
-            )
-            tblock.content_hash = _hash_content(payload)
-            blocks.append(tblock)
-            seq += 1
 
-            # Emit one row block per row, each with stable_key if discoverable
-            for ri, row in enumerate(tbl["rows"]):
-                stable_key = _detect_stable_key(row, profile)
-                row_path = f"{tblock.path}/row_{ri}"
-                row_payload = dict(zip(tbl["header"], row))
-                rblock = Block(
-                    parent_id=tblock.id,
-                    block_type=BlockType.TABLE_ROW,
-                    path=row_path,
-                    stable_key=stable_key,
-                    page_number=pno,
-                    bbox=list(tbl["bbox"]),
-                    text=" | ".join(row),
-                    payload=row_payload,
-                    sequence=seq,
+            # camelot reports bbox in PDF coords. This is still useful for
+            # approximate filtering/highlighting even if not perfect.
+            bbox = tuple(t._bbox) if hasattr(t, "_bbox") else (0, 0, 0, 0)
+            out.append({"bbox": bbox, "rows": rows, "strategy": "C"})
+
+        return out
+    except Exception:
+        return []
+
+
+def _cell_has_letters(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def _cell_is_mostly_numeric(text: str) -> bool:
+    text = _clean_cell(text)
+
+    if not text:
+        return False
+
+    compact = re.sub(r"[\s,$%/().:-]", "", text)
+    if not compact:
+        return False
+
+    digits = sum(ch.isdigit() for ch in compact)
+    letters = sum(ch.isalpha() for ch in compact)
+
+    return digits > 0 and digits >= max(1, letters * 2)
+
+
+def _is_noise_cell(text: str) -> bool:
+    return _clean_cell(text).lower() in _SYMBOL_ONLY_VALUES
+
+
+def _looks_like_header_row(row: list[str], next_rows: list[list[str]]) -> bool:
+    """
+    Decide whether a row is truly a header.
+
+    Important: in many spec PDFs the first extracted row is a value row
+    like "5,610 | 21,023". That must not become the header.
+    """
+    row = [_clean_cell(c) for c in row]
+    non_empty = [c for c in row if c]
+
+    if not non_empty:
+        return False
+
+    alpha_cells = sum(1 for c in non_empty if _cell_has_letters(c))
+    numeric_cells = sum(1 for c in non_empty if _cell_is_mostly_numeric(c))
+    noise_cells = sum(1 for c in non_empty if _is_noise_cell(c))
+    avg_len = sum(len(c) for c in non_empty) / max(1, len(non_empty))
+
+    if numeric_cells >= max(1, len(non_empty) * 0.6) and alpha_cells == 0:
+        return False
+
+    if noise_cells >= max(1, len(non_empty) * 0.6):
+        return False
+
+    if alpha_cells == 0:
+        return False
+
+    # Very long cells are usually body text, not headers.
+    if avg_len > 70:
+        return False
+
+    # Headers are normally shorter than body rows.
+    body_lengths = []
+    for body_row in next_rows[:5]:
+        body_cells = [_clean_cell(c) for c in body_row if _clean_cell(c)]
+        if body_cells:
+            body_lengths.append(sum(len(c) for c in body_cells) / len(body_cells))
+
+    if body_lengths and avg_len > (sum(body_lengths) / len(body_lengths)) * 1.8:
+        return False
+
+    return True
+
+
+def _merge_header_rows(rows: list[list[str]], max_header_rows: int = 2) -> tuple[list[str], list[list[str]]]:
+    """
+    Supports simple two-line headers, e.g.
+        ["F.E. LABEL", "", "ESTIMATED"]
+        ["CITY", "HIGHWAY", "ANNUAL FUEL COSTS"]
+    """
+    if not rows:
+        return [], []
+
+    first = rows[0]
+    second = rows[1] if len(rows) > 1 else []
+    first_is_header = _looks_like_header_row(first, rows[1:])
+    second_is_header = bool(second) and _looks_like_header_row(second, rows[2:])
+
+    if not first_is_header:
+        return _infer_fallback_headers(rows), rows
+
+    if max_header_rows >= 2 and second_is_header:
+        n_cols = max(len(first), len(second))
+        first = first + [""] * (n_cols - len(first))
+        second = second + [""] * (n_cols - len(second))
+        merged = []
+
+        for a, b in zip(first, second):
+            a = _clean_header(a)
+            b = _clean_header(b)
+
+            if a and b and a.lower() != b.lower():
+                merged.append(f"{a} / {b}")
+            else:
+                merged.append(a or b)
+
+        return _dedupe_headers(merged), rows[2:]
+
+    return _dedupe_headers(first), rows[1:]
+
+
+def _infer_fallback_headers(rows: list[list[str]]) -> list[str]:
+    """
+    If no true header is found, provide business-friendly fallback labels.
+
+    This is better than col_1/col_2 for UI users and still honest:
+    the column is inferred, not claimed as an actual PDF header.
+    """
+    if not rows:
+        return []
+
+    n_cols = max(len(r) for r in rows)
+    sample = rows[:80]
+
+    if n_cols == 1:
+        return ["Content"]
+
+    first_col_text = 0
+    other_symbol_or_short = 0
+    other_total = 0
+
+    for row in sample:
+        first = _clean_cell(row[0] if row else "")
+
+        if len(first) >= 8 or _cell_has_letters(first):
+            first_col_text += 1
+
+        for cell in row[1:]:
+            value = _clean_cell(cell)
+            if not value:
+                continue
+
+            other_total += 1
+
+            if _is_noise_cell(value) or len(value) <= 12:
+                other_symbol_or_short += 1
+
+    first_col_is_feature = first_col_text >= max(2, len(sample) * 0.35)
+    rest_are_values = other_total == 0 or (other_symbol_or_short / max(1, other_total)) >= 0.55
+
+    if first_col_is_feature and rest_are_values:
+        headers = ["Feature / item"]
+        headers.extend(f"Value {i}" for i in range(1, n_cols))
+        return headers
+
+    if n_cols == 2:
+        return ["Feature / item", "Value"]
+
+    headers = ["Feature / item"]
+    headers.extend(f"Column {i}" for i in range(2, n_cols + 1))
+    return headers
+
+
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    out = []
+    seen = defaultdict(int)
+
+    for idx, raw in enumerate(headers, start=1):
+        header = _clean_header(raw)
+
+        if not header:
+            header = f"Column {idx}"
+
+        if _is_noise_cell(header):
+            header = f"Column {idx}"
+
+        key = header.lower()
+        seen[key] += 1
+
+        if seen[key] > 1:
+            header = f"{header} {seen[key]}"
+
+        out.append(header)
+
+    return out
+
+
+def _header_quality(headers: list[str]) -> float:
+    if not headers:
+        return 0.0
+
+    useful = 0
+
+    for h in headers:
+        h = _clean_cell(h)
+
+        if not h:
+            continue
+        if _GENERIC_COL_RE.match(h):
+            continue
+        if _is_noise_cell(h):
+            continue
+        if _cell_is_mostly_numeric(h) and not _cell_has_letters(h):
+            continue
+
+        useful += 1
+
+    return useful / max(1, len(headers))
+
+
+def _chars_in_bbox(page, bbox: tuple[float, float, float, float]) -> list[dict]:
+    x0, top, x1, bottom = bbox
+    chars = []
+
+    for ch in getattr(page, "chars", []) or []:
+        cx0 = float(ch.get("x0", 0))
+        cx1 = float(ch.get("x1", 0))
+        ctop = float(ch.get("top", ch.get("y0", 0)))
+        cbottom = float(ch.get("bottom", ch.get("y1", 0)))
+
+        if cx1 < x0 or cx0 > x1 or cbottom < top or ctop > bottom:
+            continue
+
+        chars.append(ch)
+
+    return chars
+
+
+def _vertical_header_candidates(page, bbox: tuple[float, float, float, float], n_cols: int) -> list[str]:
+    """
+    Extract rotated / vertical text that sits inside the top part of the table.
+
+    pdfplumber exposes char["upright"] for rotated text in many PDFs.
+    We group vertical chars by approximate table column.
+    """
+    if not page or not bbox or n_cols <= 0:
+        return []
+
+    x0, top, x1, bottom = bbox
+    table_height = max(1.0, bottom - top)
+    table_width = max(1.0, x1 - x0)
+    header_bottom = top + min(max(70.0, table_height * 0.35), table_height)
+
+    chars = _chars_in_bbox(page, (x0, top, x1, header_bottom))
+    vertical_chars = []
+
+    for ch in chars:
+        text = ch.get("text", "")
+
+        if not text or not text.strip():
+            continue
+
+        upright = ch.get("upright", True)
+
+        if upright is False:
+            vertical_chars.append(ch)
+
+    if not vertical_chars:
+        return []
+
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    col_width = table_width / n_cols
+
+    for ch in vertical_chars:
+        cx = (float(ch.get("x0", 0)) + float(ch.get("x1", 0))) / 2
+        col_idx = int((cx - x0) / max(1.0, col_width))
+        col_idx = max(0, min(n_cols - 1, col_idx))
+        grouped[col_idx].append(ch)
+
+    headers = [""] * n_cols
+
+    for col_idx, group in grouped.items():
+        # Vertical text is usually ordered top-to-bottom. Sort by top,
+        # then x to keep stacked letters stable.
+        group = sorted(group, key=lambda c: (float(c.get("top", c.get("y0", 0))), float(c.get("x0", 0))))
+        pieces = [str(c.get("text", "")) for c in group]
+        text = "".join(pieces)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # If letters are extracted one by one, joined text can be compact.
+        # Keep it if it has letters and is not just a symbol.
+        if len(text) >= 2 and _cell_has_letters(text):
+            headers[col_idx] = _clean_header(text)
+
+    return headers
+
+
+def _extract_nearby_title(page, bbox: tuple[float, float, float, float]) -> str:
+    """
+    Capture nearby text above a table. API can use this later to name tables.
+    This does not affect downstream behavior if ignored.
+    """
+    if not page or not bbox:
+        return ""
+
+    x0, top, x1, _bottom = bbox
+    search_top = max(0, top - 90)
+    search_bottom = max(0, top - 4)
+
+    try:
+        cropped = page.crop((x0, search_top, x1, search_bottom))
+        text = cropped.extract_text() or ""
+    except Exception:
+        return ""
+
+    lines = [_clean_cell(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    if not lines:
+        return ""
+
+    # Prefer the closest meaningful line.
+    for line in reversed(lines):
+        if len(line) >= 3 and not _cell_is_mostly_numeric(line):
+            return line[:160]
+
+    return lines[-1][:160]
+
+
+def _apply_vertical_headers(
+    page,
+    bbox: tuple[float, float, float, float],
+    header: list[str],
+    body: list[list[str]],
+) -> tuple[list[str], str]:
+    """
+    Replace weak headers with vertical/rotated headers when available.
+    """
+    n_cols = max(len(header), max((len(r) for r in body), default=0))
+
+    if n_cols <= 0:
+        return header, "none"
+
+    header = header + [""] * (n_cols - len(header))
+    vertical = _vertical_header_candidates(page, bbox, n_cols)
+
+    if not vertical:
+        return _dedupe_headers(header), "normal"
+
+    merged = list(header)
+    replaced = False
+
+    for idx, candidate in enumerate(vertical):
+        if not candidate:
+            continue
+
+        current = _clean_cell(merged[idx] if idx < len(merged) else "")
+
+        if (
+            not current
+            or _GENERIC_COL_RE.match(current)
+            or _is_noise_cell(current)
+            or (_cell_is_mostly_numeric(current) and not _cell_has_letters(current))
+            or len(current) <= 3
+        ):
+            merged[idx] = candidate
+            replaced = True
+
+    # If the whole detected header is weak, use vertical headers directly.
+    if _header_quality(header) < 0.45 and _header_quality(vertical) > _header_quality(header):
+        merged = [vertical[i] or header[i] for i in range(n_cols)]
+        replaced = True
+
+    return _dedupe_headers(merged), "vertical" if replaced else "normal"
+
+
+def _split_header_body(
+    raw_rows: list[list[str]],
+    page=None,
+    bbox: Optional[tuple[float, float, float, float]] = None,
+) -> tuple[list[str], list[list[str]], str]:
+    """
+    Pick a trustworthy header and body.
+
+    If the PDF has vertical headers, supplement/replace weak extracted headers.
+    If no real header exists, return inferred business-friendly headers and
+    keep all rows as body rows.
+    """
+    rows = _normalize_rows(raw_rows)
+
+    if not rows:
+        return [], [], "empty"
+
+    header, body = _merge_header_rows(rows)
+
+    source = "inferred" if body is rows or header == _infer_fallback_headers(rows) else "normal"
+
+    if bbox is not None:
+        header, vertical_source = _apply_vertical_headers(page, bbox, header, body)
+
+        if vertical_source == "vertical":
+            source = "vertical"
+
+    if _header_quality(header) < 0.35:
+        header = _infer_fallback_headers(body or rows)
+        source = "inferred"
+
+    # Ensure every body row has the same width as the header.
+    n_cols = max(len(header), max((len(r) for r in body), default=0))
+    header = _dedupe_headers(header + [""] * (n_cols - len(header)))
+
+    normalized_body = []
+    for row in body:
+        row = row + [""] * (n_cols - len(row))
+        normalized_body.append(row[:n_cols])
+
+    return header, normalized_body, source
+
+
+def _bboxes_overlap(b1, b2, tol: float = 5.0) -> bool:
+    return not (
+        b1[2] < b2[0] - tol
+        or b2[2] < b1[0] - tol
+        or b1[3] < b2[1] - tol
+        or b2[3] < b1[1] - tol
+    )
+
+
+def _looks_like_text_columns(rows: list[list[str]]) -> bool:
+    """
+    Detect when pdfplumber has mistaken multi-column page layout
+    for a table.
+
+    Signals:
+      * cells contain very long text
+      * many cells start with bullets
+      * the table has too few structured rows
+    """
+    if not rows:
+        return False
+
+    long_cells = 0
+    bullet_cells = 0
+    total_cells = 0
+
+    for row in rows:
+        for cell in row:
+            cell = _clean_cell(cell)
+
+            if not cell:
+                continue
+
+            total_cells += 1
+
+            if len(cell) > 220:
+                long_cells += 1
+
+            if cell.lstrip().startswith(("●", "—", "○", "•", "▪", "◦")):
+                bullet_cells += 1
+
+    if total_cells == 0:
+        return False
+
+    if long_cells / total_cells > 0.20:
+        return True
+
+    if bullet_cells / total_cells > 0.35:
+        return True
+
+    return False
+
+
+def _table_has_enough_structure(rows: list[list[str]]) -> bool:
+    if len(rows) < 2:
+        return False
+
+    n_cols = max(len(r) for r in rows)
+
+    if n_cols < 2:
+        return False
+
+    filled = 0
+    total = n_cols * len(rows)
+
+    for row in rows:
+        for cell in row:
+            if _clean_cell(cell):
+                filled += 1
+
+    fill_ratio = filled / max(1, total)
+
+    # Low fill can still be a valid options table with sparse marks,
+    # but it needs several rows to be useful.
+    if fill_ratio < 0.18 and len(rows) < 5:
+        return False
+
+    return True
+
+
+def _dedupe_overlapping_tables(tables: list[dict]) -> list[dict]:
+    """
+    When strategies A/B/C return overlapping tables, keep the richer one.
+    """
+    kept: list[dict] = []
+
+    def richness(table: dict) -> tuple[int, int, int]:
+        rows = table.get("rows", [])
+        n_cols = max((len(r) for r in rows), default=0)
+        filled = sum(1 for row in rows for cell in row if _clean_cell(cell))
+        return (n_cols, len(rows), filled)
+
+    for table in sorted(tables, key=richness, reverse=True):
+        bbox = table.get("bbox")
+
+        if not bbox:
+            kept.append(table)
+            continue
+
+        overlaps_existing = False
+
+        for existing in kept:
+            existing_bbox = existing.get("bbox")
+
+            if existing_bbox and _bboxes_overlap(bbox, existing_bbox, tol=8):
+                overlaps_existing = True
+                break
+
+        if not overlaps_existing:
+            kept.append(table)
+
+    return sorted(kept, key=lambda t: (t.get("bbox") or (0, 0, 0, 0))[1])
+
+
+def extract_tables_robust(pdf_path: str) -> dict[int, list[dict]]:
+    """
+    Returns:
+        {
+          page_num: [
+            {
+              "bbox": ...,
+              "header": [...],
+              "rows": [[...]],
+              "strategy": "A|B|C",
+              "header_source": "normal|vertical|inferred",
+              "near_text": "optional text above table"
+            }
+          ]
+        }
+
+    Existing downstream code only requires bbox/header/rows/strategy.
+    Extra metadata is safe for future API/UI improvements.
+    """
+    by_page: dict[int, list[dict]] = {}
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for pno, page in enumerate(pdf.pages, start=1):
+            results: list[dict] = []
+
+            a_results = _strategy_a(page)
+            results.extend(a_results)
+
+            # Strategy B is aggressive. Use it when A found nothing, or when
+            # A found sparse/weak tables that may have missed text-aligned columns.
+            run_b = not a_results or any(_is_sparse(r["rows"]) > 0.30 for r in a_results)
+
+            if run_b:
+                b_results = _strategy_b(page)
+
+                for br in b_results:
+                    rows = br["rows"]
+
+                    if not _table_has_enough_structure(rows):
+                        continue
+
+                    results.append(br)
+
+            # If still nothing on a page that has table-shaped text,
+            # fall back to camelot.
+            if not results:
+                txt = page.extract_text() or ""
+                digit_count = sum(c.isdigit() for c in txt)
+
+                if txt.count("\n") > 5 and digit_count > 20:
+                    results.extend(_strategy_c(pdf_path, pno))
+
+            results = _dedupe_overlapping_tables(results)
+
+            cleaned: list[dict] = []
+
+            for result in results:
+                rows = _forward_fill_rowspans(result["rows"])
+
+                if not rows:
+                    continue
+
+                if _looks_like_text_columns(rows):
+                    continue
+
+                if not _table_has_enough_structure(rows):
+                    continue
+
+                bbox = tuple(result["bbox"])
+                header, body, header_source = _split_header_body(rows, page=page, bbox=bbox)
+
+                if not body:
+                    continue
+
+                cleaned.append(
+                    {
+                        "bbox": bbox,
+                        "header": header,
+                        "rows": body,
+                        "strategy": result["strategy"],
+                        "header_source": header_source,
+                        "near_text": _extract_nearby_title(page, bbox),
+                    }
                 )
-                rblock.content_hash = _hash_content(row_payload)
-                blocks.append(rblock)
-                seq += 1
 
-    for ln in lines:
-        # Emit any tables whose top is above this line, before consuming it
-        _emit_tables_for_page(ln.page)
+            if cleaned:
+                by_page[pno] = cleaned
 
-        if _row_bbox_overlaps(ln, table_bboxes_by_page.get(ln.page, [])):
-            continue  # text inside a table — already captured
-
-        # Section heading?
-        if _is_heading(ln, body):
-            slug = _slug(ln.text)
-            # Determine depth by relative size: bigger size = shallower
-            depth = max(1, int(round((ln.avg_size - body) / max(0.5, body * 0.1))))
-            depth = min(depth, len(path_stack) + 1)
-            path_stack = path_stack[:depth - 1] + [slug]
-            payload = {"heading": ln.text, "size": ln.avg_size}
-            blk = Block(
-                parent_id=current_section_block.id if (current_section_block and depth > 1) else None,
-                block_type=BlockType.SECTION,
-                path="/" + "/".join(path_stack),
-                page_number=ln.page,
-                bbox=[ln.x0, ln.y, ln.x1, ln.y + ln.avg_size],
-                text=ln.text,
-                payload=payload,
-                sequence=seq,
-            )
-            blk.content_hash = _hash_content(payload)
-            blocks.append(blk)
-            seq += 1
-            current_section_block = blk
-            continue
-
-        # Key/value line?
-        m = _TYPICAL_KEY_RE.match(ln.text)
-        if m:
-            payload = {"key": m.group("key").strip(), "value": m.group("val").strip()}
-            kvpath = (current_section_block.path if current_section_block else "/root") + f"/kv_{seq}"
-            blk = Block(
-                parent_id=current_section_block.id if current_section_block else None,
-                block_type=BlockType.KV_PAIR,
-                path=kvpath,
-                page_number=ln.page,
-                bbox=[ln.x0, ln.y, ln.x1, ln.y + ln.avg_size],
-                text=ln.text,
-                payload=payload,
-                sequence=seq,
-            )
-            blk.content_hash = _hash_content(payload)
-            blocks.append(blk)
-            seq += 1
-            continue
-
-        # List item? (starts with "● " or "— " or "-")
-        list_marker_match = re.match(r"^\s*([●○■•—–\-])\s+(.*)$", ln.text)
-        if list_marker_match:
-            payload = {"marker": list_marker_match.group(1), "text": list_marker_match.group(2).strip()}
-            base = current_section_block.path if current_section_block else "/root"
-            blk = Block(
-                parent_id=current_section_block.id if current_section_block else None,
-                block_type=BlockType.LIST_ITEM,
-                path=f"{base}/list_{seq}",
-                page_number=ln.page,
-                bbox=[ln.x0, ln.y, ln.x1, ln.y + ln.avg_size],
-                text=payload["text"],
-                payload=payload,
-                sequence=seq,
-            )
-            blk.content_hash = _hash_content(payload)
-            blocks.append(blk)
-            seq += 1
-            continue
-
-        # Plain paragraph line
-        payload = {"text": ln.text}
-        base = current_section_block.path if current_section_block else "/root"
-        blk = Block(
-            parent_id=current_section_block.id if current_section_block else None,
-            block_type=BlockType.PARAGRAPH,
-            path=f"{base}/p_{seq}",
-            page_number=ln.page,
-            bbox=[ln.x0, ln.y, ln.x1, ln.y + ln.avg_size],
-            text=ln.text,
-            payload=payload,
-            sequence=seq,
-        )
-        blk.content_hash = _hash_content(payload)
-        blocks.append(blk)
-        seq += 1
-
-    # Catch any tables we never reached via line iteration
-    for pno in tables_by_page.keys():
-        _emit_tables_for_page(pno)
-
-    return blocks
-
-
-# ---------------------------------------------------------------------
-#  Stable-key detection
-# ---------------------------------------------------------------------
-def _detect_stable_key(row: list[str], profile: Optional[TemplateProfile]) -> Optional[str]:
-    """
-    Pick out a stable identifier from a table row.
-
-    Strategy (in order):
-      1. If a TemplateProfile is provided, use its stable_key_patterns.
-      2. Otherwise: any cell that matches a 2-4 char alphanumeric code
-         not equal to common short words ('S', 'O', 'M', 'I'), and not
-         purely a single letter, gets used.
-      3. Failing that: return None.
-    """
-    if profile:
-        for spec in profile.stable_key_patterns:
-            rx = re.compile(spec["regex"])
-            for cell in row:
-                m = rx.search(cell)
-                if m:
-                    return m.group(0)
-
-    # Generic fallback. Look for tokens like 765, 99H, 44T, 43L, EA, G4, DB, 221A.
-    code_rx = re.compile(r"^[A-Z0-9]{2,4}[A-Z]?$")
-    for cell in row:
-        cell = (cell or "").strip()
-        if cell in {"S", "O", "M", "I"}:
-            continue
-        if code_rx.fullmatch(cell):
-            return cell
-    return None
-
-
-# ---------------------------------------------------------------------
-#  Coverage check (from ARCHITECTURE §accuracy)
-# ---------------------------------------------------------------------
-def coverage_pct(pdf_path: str, blocks: Iterable[Block]) -> float:
-    """
-    Percentage of source PDF text characters that ended up in a block.
-    Useful as a smoke-test for extraction completeness.
-    """
-    raw = ""
-    doc = fitz.open(pdf_path)
-    for page in doc:
-        raw += page.get_text() or ""
-    doc.close()
-    raw_chars = sum(1 for c in raw if not c.isspace())
-
-    block_chars = 0
-    for b in blocks:
-        if b.block_type == BlockType.TABLE:
-            continue          # rows already counted separately
-        if b.block_type == BlockType.TABLE_ROW:
-            block_chars += sum(1 for c in (b.text or "") if not c.isspace())
-        else:
-            block_chars += sum(1 for c in (b.text or "") if not c.isspace())
-
-    if raw_chars == 0:
-        return 100.0
-    return min(100.0, 100.0 * block_chars / raw_chars)
+    return by_page
