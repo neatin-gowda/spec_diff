@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db import db_enabled, get_conn
+from .embeddings import embed_texts, vector_literal
 from .models import Block, BlockDiff
 
 
@@ -204,6 +205,50 @@ def _row_label(row: Block) -> str:
     return _clean(row.text)[:300]
 
 
+def _embedding_text(block: Block) -> str:
+    payload = _payload(block)
+    parts = [
+        block.block_type.value,
+        block.path or "",
+        block.stable_key or "",
+        block.text or "",
+    ]
+
+    if block.block_type.value in {"table", "table_row"}:
+        title = payload.get("table_title") or payload.get("__table_title__")
+        context = payload.get("table_context") or payload.get("__table_context__")
+        if title:
+            parts.append(str(title))
+        if context:
+            parts.append(str(context))
+
+        if block.block_type.value == "table":
+            header = payload.get("header")
+            if isinstance(header, list):
+                parts.append(" | ".join(str(h or "") for h in header))
+
+        if block.block_type.value == "table_row":
+            values = _row_values(block)
+            parts.extend(f"{key}: {value}" for key, value in values.items())
+
+    text = _clean(" | ".join(str(p or "") for p in parts))
+    return text[:7500]
+
+
+def _block_embeddings(blocks: list[Block]) -> dict[Any, Optional[str]]:
+    texts = [_embedding_text(block) for block in blocks]
+
+    try:
+        vectors = embed_texts(texts)
+    except Exception:
+        vectors = [None] * len(blocks)
+
+    return {
+        block.id: vector_literal(vector)
+        for block, vector in zip(blocks, vectors)
+    }
+
+
 def persist_run(
     *,
     run_id: str,
@@ -221,6 +266,7 @@ def persist_run(
     coverage: dict,
     base_page_count: int,
     target_page_count: int,
+    enable_embeddings: bool = True,
 ) -> Optional[str]:
     """
     Persist comparison data to PostgreSQL.
@@ -252,8 +298,8 @@ def persist_run(
             coverage=coverage.get("target"),
         )
 
-        base_block_map = _insert_blocks(conn, base_doc_id, base_blocks)
-        target_block_map = _insert_blocks(conn, target_doc_id, target_blocks)
+        base_block_map = _insert_blocks(conn, base_doc_id, base_blocks, enable_embeddings=enable_embeddings)
+        target_block_map = _insert_blocks(conn, target_doc_id, target_blocks, enable_embeddings=enable_embeddings)
 
         _insert_tables(conn, base_doc_id, base_blocks, base_block_map)
         _insert_tables(conn, target_doc_id, target_blocks, target_block_map)
@@ -333,10 +379,11 @@ def _upsert_document(
     return row["id"]
 
 
-def _insert_blocks(conn, document_id, blocks: list[Block]) -> dict[Any, uuid.UUID]:
+def _insert_blocks(conn, document_id, blocks: list[Block], *, enable_embeddings: bool) -> dict[Any, uuid.UUID]:
     conn.execute("DELETE FROM doc_block WHERE document_id = %s", (document_id,))
 
     block_id_map: dict[Any, uuid.UUID] = {}
+    embeddings = _block_embeddings(blocks) if enable_embeddings else {}
 
     for block in blocks:
         sql_id = uuid.uuid4()
@@ -359,10 +406,11 @@ def _insert_blocks(conn, document_id, blocks: list[Block]) -> dict[Any, uuid.UUI
                 bbox,
                 text,
                 payload,
+                embedding,
                 content_hash,
                 sequence
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s, %s)
             """,
             (
                 sql_id,
@@ -375,6 +423,7 @@ def _insert_blocks(conn, document_id, blocks: list[Block]) -> dict[Any, uuid.UUI
                 block.bbox,
                 block.text,
                 _json(block.payload or {}),
+                embeddings.get(block.id),
                 block.content_hash,
                 block.sequence,
             ),
