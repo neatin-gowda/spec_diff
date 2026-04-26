@@ -247,12 +247,24 @@ def get_overlay(run_id: str, side: str, n: int):
 
         if not blk.bbox:
             continue
+
+        side_blocks = r["base_blocks"] if side == "base" else r["target_blocks"]
+        has_row_children = any(
+            c.parent_id == blk.id and c.block_type.value == "table_row"
+            for c in side_blocks
+        )
+        if blk.block_type.value == "table" and has_row_children:
+            continue
+
         regions.append({
             "bbox": blk.bbox,
             "change_type": d.change_type.value,
             "color": color_map[d.change_type.value],
             "stable_key": blk.stable_key,
             "block_type": blk.block_type.value,
+            "page_width": blk.payload.get("page_width") if isinstance(blk.payload, dict) else None,
+            "page_height": blk.payload.get("page_height") if isinstance(blk.payload, dict) else None,
+
         })
     return {"page": n, "side": side, "regions": regions}
 
