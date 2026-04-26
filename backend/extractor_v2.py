@@ -9,6 +9,7 @@ Adds, beyond v1:
     defined terms, alphanumeric codes)
   * Defined-term discovery pass (for legal/lease docs)
   * Better table row keys and column-aware row text for query/report use
+  * Preserves table metadata for user-facing table names and previews
 
 Output shape unchanged - still produces a flat list of Block objects
 that the differ already understands.
@@ -18,30 +19,25 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import Counter
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import fitz
 
 from .anchors import (
-    Anchor,
-    anchor_signature,
     discover_defined_terms,
     find_anchored_terms,
     find_anchors,
 )
-from .extractor import (    # reuse what already works from v1
+from .extractor import (  # reuse what already works from v1
     _Line,
+    _TYPICAL_KEY_RE,
     _body_font_size,
     _is_heading,
     _row_bbox_overlaps,
-    _TYPICAL_KEY_RE,
     coverage_pct,
     render_pages,
 )
-from .image_text import extract_image_text, is_scanned_page, ocr_full_page
+from .image_text import extract_image_text, ocr_full_page
 from .models import Block, BlockType, TemplateProfile
 from .table_extractor import extract_tables_robust
 from .table_stitcher import stitch_tables
@@ -59,6 +55,7 @@ _IDENTIFIER_HEADER_TERMS = (
     "option",
     "order",
     "package",
+    "pcv",
     "pcb",
     "sku",
     "ref",
@@ -125,9 +122,9 @@ def _clean_cell(value: object) -> str:
 def _header_name(value: object, index: int) -> str:
     text = _clean_cell(value)
     if not text:
-        return f"col_{index}"
+        return f"Column {index + 1}"
     text = re.sub(r"\s+", " ", text)
-    return text[:80]
+    return text[:90]
 
 
 def _header_key(value: object) -> str:
@@ -166,12 +163,12 @@ def _looks_like_identifier(value: str) -> bool:
     if _looks_like_money_or_measure(text):
         return False
 
-    # Codes like E1, 44Q, 99H, 205, PCB-205, ABC123.
-    if re.fullmatch(r"[A-Z]{1,6}[- ]?\d{1,6}[A-Z]?", text, re.I):
+    # Codes like E1, 44Q, 99H, 205, PCV-205, PCB-205, ABC123.
+    if re.fullmatch(r"[A-Z]{1,8}[- ]?\d{1,8}[A-Z]?", text, re.I):
         return True
-    if re.fullmatch(r"\d{2,6}[A-Z]?", text, re.I):
+    if re.fullmatch(r"\d{2,8}[A-Z]?", text, re.I):
         return True
-    if re.fullmatch(r"[A-Z0-9]{2,6}[A-Z]?", text, re.I):
+    if re.fullmatch(r"[A-Z0-9]{2,8}[A-Z]?", text, re.I):
         return True
 
     return False
@@ -188,7 +185,7 @@ def _row_payload(header: list[str], row: list[str]) -> dict:
         key = _header_name(raw_key, i)
 
         if key in used:
-            key = f"{key}_{i}"
+            key = f"{key} {i + 1}"
         used.add(key)
 
         value = _clean_cell(row[i]) if i < len(row) else ""
@@ -205,10 +202,11 @@ def _row_text_from_payload(payload: dict[str, str]) -> str:
         if not value:
             continue
 
-        if str(key).lower().startswith("col_"):
+        key_text = str(key)
+        if re.match(r"^(col|column)\s*[_-]?\s*\d+$", key_text, re.I):
             parts.append(value)
         else:
-            parts.append(f"{key}: {value}")
+            parts.append(f"{key_text}: {value}")
 
     return " | ".join(parts)
 
@@ -225,6 +223,7 @@ def _detect_stable_key(
                 rx = re.compile(spec["regex"])
             except re.error:
                 continue
+
             for cell in row:
                 m = rx.search(_clean_cell(cell))
                 if m:
@@ -258,7 +257,7 @@ def _detect_stable_key(
             continue
 
         if len(cell) >= 3 and not _looks_like_money_or_measure(cell):
-            return cell[:80]
+            return cell[:100]
 
     return None
 
@@ -266,6 +265,7 @@ def _detect_stable_key(
 def _collect_lines_with_filter(pdf_path: str) -> list[_Line]:
     """Identical to v1's _collect_lines, kept here for explicit reuse."""
     from .extractor import _collect_lines
+
     return _collect_lines(pdf_path)
 
 
@@ -274,6 +274,74 @@ def _table_sort_key(st) -> tuple[int, float]:
     bbox = st.bboxes_by_page.get(first_page)
     y0 = bbox[1] if bbox else 0.0
     return first_page, y0
+
+
+def _title_from_context(path_stack: list[str], near_texts: list[str], header: list[str], first_page: int) -> str:
+    for text in near_texts:
+        text = _clean_cell(text)
+        if len(text) >= 3:
+            return text[:140]
+
+    for part in reversed(path_stack):
+        label = part.replace("_", " ").title()
+        if label and label.lower() != "root":
+            return label[:140]
+
+    useful_headers = [h for h in header if h and not re.match(r"^(col|column)\s*[_-]?\s*\d+$", h, re.I)]
+    if useful_headers:
+        return " / ".join(useful_headers[:3])[:140]
+
+    return f"Table on page {first_page}"
+
+
+def _table_context(path_stack: list[str], near_texts: list[str]) -> str:
+    parts = []
+
+    if path_stack:
+        parts.append(" / ".join(p.replace("_", " ").title() for p in path_stack if p))
+
+    parts.extend(_clean_cell(t) for t in near_texts if _clean_cell(t))
+
+    seen = set()
+    out = []
+
+    for part in parts:
+        key = part.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(part)
+
+    return " | ".join(out[:4])[:300]
+
+
+def _meta_list(st, attr: str) -> list:
+    value = getattr(st, attr, [])
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _source_table_metadata(st) -> list[dict]:
+    out = []
+
+    for item in _meta_list(st, "source_tables"):
+        if not isinstance(item, dict):
+            continue
+
+        out.append(
+            {
+                "page": item.get("page"),
+                "bbox": item.get("bbox"),
+                "header": item.get("header"),
+                "header_source": item.get("header_source"),
+                "strategy": item.get("strategy"),
+                "near_text": item.get("near_text"),
+                "n_rows": item.get("n_rows"),
+            }
+        )
+
+    return out
 
 
 def extract_blocks_v2(
@@ -290,7 +358,7 @@ def extract_blocks_v2(
     lines = _collect_lines_with_filter(pdf_path)
 
     if not lines:
-        # Possibly a fully scanned PDF - try full-page OCR
+        # Possibly a fully scanned PDF - try full-page OCR.
         if enable_ocr:
             doc = fitz.open(pdf_path)
             n_pages = len(doc)
@@ -331,7 +399,7 @@ def extract_blocks_v2(
     tables_by_page = extract_tables_robust(pdf_path)
     stitched = sorted(stitch_tables(tables_by_page), key=_table_sort_key)
 
-    # Build per-page table bboxes for line filtering
+    # Build per-page table bboxes for line filtering.
     table_bboxes_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
 
     for st in stitched:
@@ -360,11 +428,25 @@ def extract_blocks_v2(
         header = [_header_name(h, i) for i, h in enumerate(st.header or [])]
         header_text = " | ".join(header)
 
+        near_texts = [_clean_cell(t) for t in _meta_list(st, "near_texts") if _clean_cell(t)]
+        header_sources = [str(x) for x in _meta_list(st, "header_sources") if x]
+        strategies = [str(x) for x in _meta_list(st, "strategies") if x]
+        source_tables = _source_table_metadata(st)
+
+        table_title = _title_from_context(path_stack, near_texts, header, first_page)
+        context = _table_context(path_stack, near_texts)
+
         payload = {
             "header": header,
             "rows": st.rows,
             "spans_pages": st.pages,
             "stitched_from": st.source_count,
+            "table_title": table_title,
+            "table_context": context,
+            "near_texts": near_texts,
+            "header_sources": header_sources,
+            "strategies": strategies,
+            "source_tables": source_tables,
             "page_width": page_width,
             "page_height": page_height,
         }
@@ -372,6 +454,9 @@ def extract_blocks_v2(
         anchors_in_table = []
         for h in header:
             anchors_in_table.extend(find_anchors(h or ""))
+        for t in near_texts:
+            anchors_in_table.extend(find_anchors(t or ""))
+
         anc_sig = list({a.key() for a in anchors_in_table})
 
         tblock = Block(
@@ -380,7 +465,7 @@ def extract_blocks_v2(
             path="/" + tbl_path,
             page_number=first_page,
             bbox=bbox,
-            text=header_text,
+            text=table_title or header_text,
             payload={**payload, "anchors": anc_sig},
             sequence=seq,
         )
@@ -410,6 +495,9 @@ def extract_blocks_v2(
 
             row_payload["__anchors__"] = [a.key() for a in anchors]
             row_payload["__pages__"] = st.pages
+            row_payload["__row_index__"] = ri
+            row_payload["__table_title__"] = table_title
+            row_payload["__table_context__"] = context
             row_payload["page_width"] = page_width
             row_payload["page_height"] = page_height
 
@@ -446,7 +534,7 @@ def extract_blocks_v2(
         # This keeps tables closer to the section heading that precedes them.
         _emit_tables_before_line(ln)
 
-        # Skip lines inside any table region
+        # Skip lines inside any table region.
         if _row_bbox_overlaps(ln, table_bboxes_by_page.get(ln.page, [])):
             continue
 
@@ -455,7 +543,7 @@ def extract_blocks_v2(
             slug = _slug(ln.text)
             depth = max(1, int(round((ln.avg_size - body) / max(0.5, body * 0.1))))
             depth = min(depth, len(path_stack) + 1)
-            path_stack = path_stack[:depth - 1] + [slug]
+            path_stack = path_stack[: depth - 1] + [slug]
 
             page_width, page_height = page_sizes.get(ln.page, (612, 792))
             anchors = find_anchors(ln.text) + find_anchored_terms(ln.text, defined_terms)
@@ -542,7 +630,7 @@ def extract_blocks_v2(
             seq += 1
             continue
 
-        # Plain paragraph
+        # Plain paragraph.
         anchors = find_anchors(ln.text) + find_anchored_terms(ln.text, defined_terms)
         page_width, page_height = page_sizes.get(ln.page, (612, 792))
         payload = {
@@ -567,7 +655,7 @@ def extract_blocks_v2(
         blocks.append(blk)
         seq += 1
 
-    # Emit any remaining tables we did not reach via line iteration
+    # Emit any remaining tables we did not reach via line iteration.
     for idx, st in enumerate(stitched):
         if idx not in emitted_table_indexes:
             _emit_table(st, idx)
