@@ -8,30 +8,17 @@ const BRAND = {
 };
 
 const COLORS = {
-  ADDED: {
-    bg: "rgba(31, 160, 70, 0.18)",
-    border: "#1e8a47",
-    text: "#176c38",
-    chip: "#e8f6ed",
-  },
-  DELETED: {
-    bg: "rgba(218, 54, 54, 0.16)",
-    border: "#bb3030",
-    text: "#9f2525",
-    chip: "#fff0f0",
-  },
-  MODIFIED: {
-    bg: "rgba(218, 185, 42, 0.22)",
-    border: "#9a7a10",
-    text: "#735c11",
-    chip: "#fff8d8",
-  },
+  ADDED: { bg: "rgba(31,160,70,.18)", border: "#1e8a47", text: "#176c38", chip: "#e8f6ed" },
+  DELETED: { bg: "rgba(218,54,54,.16)", border: "#bb3030", text: "#9f2525", chip: "#fff0f0" },
+  MODIFIED: { bg: "rgba(218,185,42,.22)", border: "#9a7a10", text: "#735c11", chip: "#fff8d8" },
+  MATCH: { bg: "#eef4ff", border: "#5d6b98", text: "#344054", chip: "#eef4ff" },
 };
 
 const css = `
   * { box-sizing: border-box; }
   body { margin: 0; }
   button, input, select { font: inherit; }
+  code { background: #f2eee6; border: 1px solid #e0d8ca; border-radius: 5px; padding: 1px 5px; }
 `;
 
 const shellStyle = {
@@ -51,7 +38,7 @@ const panelStyle = {
   background: "#fffdf8",
   border: "1px solid #ded6c8",
   borderRadius: 10,
-  boxShadow: "0 1px 3px rgba(31, 41, 55, 0.08)",
+  boxShadow: "0 1px 3px rgba(31,41,55,.08)",
 };
 
 async function readResponseError(resp) {
@@ -155,11 +142,7 @@ export default function App() {
     });
 
     try {
-      const resp = await fetch(`${API}/compare`, {
-        method: "POST",
-        body: form,
-      });
-
+      const resp = await fetch(`${API}/compare`, { method: "POST", body: form });
       if (!resp.ok) throw new Error(await readResponseError(resp));
 
       const data = await resp.json();
@@ -191,8 +174,7 @@ export default function App() {
   };
 
   const downloadReport = () => {
-    if (!runId) return;
-    window.location.href = `${API}/runs/${runId}/report.pdf`;
+    if (runId) window.location.href = `${API}/runs/${runId}/report.pdf`;
   };
 
   const isComplete = meta?.status === "complete";
@@ -201,11 +183,7 @@ export default function App() {
     <div style={shellStyle}>
       <style>{css}</style>
       <div style={pageStyle}>
-        <Header
-          runId={isComplete ? runId : null}
-          onStartOver={startOver}
-          onDownloadReport={downloadReport}
-        />
+        <Header runId={isComplete ? runId : null} onStartOver={startOver} onDownloadReport={downloadReport} />
 
         {!isComplete && (
           <section style={{ ...panelStyle, padding: 22, marginBottom: 16 }}>
@@ -228,12 +206,7 @@ export default function App() {
 
             <main style={{ ...panelStyle, padding: 12 }}>
               {tab === "viewer" && (
-                <SideBySide
-                  runId={runId}
-                  meta={meta}
-                  pageNum={pageNum}
-                  setPageNum={setPageNum}
-                />
+                <SideBySide runId={runId} meta={meta} pageNum={pageNum} setPageNum={setPageNum} />
               )}
               {tab === "report" && <ReviewReport runId={runId} />}
               {tab === "query" && <QueryPanel runId={runId} />}
@@ -271,9 +244,7 @@ function Header({ runId, onStartOver, onDownloadReport }) {
               {BRAND.name}
             </h1>
           </div>
-          <p style={{ margin: "6px 0 0", color: "#667085", fontSize: 15 }}>
-            {BRAND.subtitle}
-          </p>
+          <p style={{ margin: "6px 0 0", color: "#667085", fontSize: 15 }}>{BRAND.subtitle}</p>
         </div>
 
         {runId && (
@@ -302,18 +273,8 @@ function UploadPanel({ onUpload, busy }) {
           alignItems: "stretch",
         }}
       >
-        <FileInput
-          label="Baseline document"
-          helper="Previous, approved, or reference PDF"
-          name="base"
-          disabled={busy}
-        />
-        <FileInput
-          label="Revised document"
-          helper="Latest, proposed, or updated PDF"
-          name="target"
-          disabled={busy}
-        />
+        <FileInput label="Baseline document" helper="Previous, approved, or reference PDF" name="base" disabled={busy} />
+        <FileInput label="Revised document" helper="Latest, proposed, or updated PDF" name="target" disabled={busy} />
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <label
@@ -344,14 +305,7 @@ function UploadPanel({ onUpload, busy }) {
         </div>
       </div>
 
-      <div
-        style={{
-          marginTop: 16,
-          display: "grid",
-          gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-          gap: 10,
-        }}
-      >
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
         <Capability label="Semantic review" detail="Finds meaningful content changes, not layout noise." />
         <Capability label="Visual evidence" detail="Highlights additions, removals, and modifications." />
         <Capability label="Business report" detail="Creates a PDF report with citations and review items." />
@@ -395,13 +349,7 @@ function FileInput({ label, helper, name, disabled }) {
         disabled={disabled}
         onClick={(e) => e.stopPropagation()}
         onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
-        style={{
-          position: "absolute",
-          width: 1,
-          height: 1,
-          opacity: 0,
-          pointerEvents: "none",
-        }}
+        style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
       />
 
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
@@ -448,14 +396,7 @@ function FileInput({ label, helper, name, disabled }) {
 
 function Capability({ label, detail }) {
   return (
-    <div
-      style={{
-        background: "#fbfaf6",
-        border: "1px solid #e0d8ca",
-        borderRadius: 8,
-        padding: 11,
-      }}
-    >
+    <div style={{ background: "#fbfaf6", border: "1px solid #e0d8ca", borderRadius: 8, padding: 11 }}>
       <div style={{ fontSize: 13, fontWeight: 650, color: "#344054" }}>{label}</div>
       <div style={{ marginTop: 4, fontSize: 12, color: "#667085", lineHeight: 1.35 }}>{detail}</div>
     </div>
@@ -471,7 +412,6 @@ function ProcessingState({ progress, message, status }) {
         <span style={{ fontWeight: 650 }}>{message}</span>
         <span>{safeProgress}%</span>
       </div>
-
       <div style={{ height: 8, background: "#e8dfd2", borderRadius: 999, overflow: "hidden" }}>
         <div
           style={{
@@ -482,7 +422,6 @@ function ProcessingState({ progress, message, status }) {
           }}
         />
       </div>
-
       <p style={{ margin: "10px 0 0", color: "#667085", fontSize: 13 }}>
         Results will appear automatically when processing completes.
       </p>
@@ -514,17 +453,7 @@ function StatsBar({ meta }) {
   const s = meta.stats || {};
 
   return (
-    <section
-      style={{
-        ...panelStyle,
-        padding: 12,
-        display: "flex",
-        gap: 8,
-        marginBottom: 12,
-        flexWrap: "wrap",
-        alignItems: "center",
-      }}
-    >
+    <section style={{ ...panelStyle, padding: 12, display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
       <StatChip label="Added" value={s.ADDED || 0} tone="added" />
       <StatChip label="Deleted" value={s.DELETED || 0} tone="deleted" />
       <StatChip label="Modified" value={s.MODIFIED || 0} tone="modified" />
@@ -546,18 +475,7 @@ function StatChip({ label, value, tone }) {
           : { borderColor: "#d8d0c3", background: "#fbfaf6", color: "#475467" };
 
   return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "baseline",
-        gap: 6,
-        border: "1px solid",
-        borderRadius: 999,
-        padding: "5px 10px",
-        fontSize: 13,
-        ...toneStyle,
-      }}
-    >
+    <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6, border: "1px solid", borderRadius: 999, padding: "5px 10px", fontSize: 13, ...toneStyle }}>
       <span>{label}</span>
       <strong style={{ fontWeight: 650 }}>{value}</strong>
     </span>
@@ -612,9 +530,7 @@ function SideBySide({ runId, meta, pageNum, setPageNum }) {
         <button onClick={() => setPageNum(Math.max(1, pageNum - 1))} disabled={pageNum <= 1} style={navButtonStyle(pageNum <= 1)}>
           Prev
         </button>
-        <span style={{ fontSize: 17, fontWeight: 650, minWidth: 100 }}>
-          Page {pageNum} / {maxPages}
-        </span>
+        <span style={{ fontSize: 17, fontWeight: 650, minWidth: 100 }}>Page {pageNum} / {maxPages}</span>
         <button onClick={() => setPageNum(Math.min(maxPages, pageNum + 1))} disabled={pageNum >= maxPages} style={navButtonStyle(pageNum >= maxPages)}>
           Next
         </button>
@@ -828,10 +744,8 @@ function ReviewReport({ runId }) {
                       {r.stable_key && <code style={{ display: "inline-block", marginTop: 5 }}>Key {r.stable_key}</code>}
                     </td>
                     <td style={td}>
-                      <span style={{ display: "inline-block", marginBottom: 6, background: color.chip, color: color.text, border: `1px solid ${color.border}`, padding: "2px 8px", borderRadius: 999, fontWeight: 650, fontSize: 12 }}>
-                        {r.change_type || "CHANGE"}
-                      </span>
-                      <div>{r.change}</div>
+                      <ChangeBadge type={r.change_type || "MODIFIED"} />
+                      <div style={{ marginTop: 6 }}>{r.change}</div>
                     </td>
                     <td style={td}>
                       <div>{r.citation || "-"}</div>
@@ -862,6 +776,460 @@ function ReviewReport({ runId }) {
   );
 }
 
+function QueryPanel({ runId }) {
+  const [q, setQ] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [results, setResults] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const ask = async () => {
+    if (!q.trim()) return;
+    setBusy(true);
+    setAnswer("");
+    setResults(null);
+
+    try {
+      const r = await fetch(`${API}/runs/${runId}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: q }),
+      });
+
+      if (!r.ok) throw new Error(await readResponseError(r));
+
+      const data = await r.json();
+      setAnswer(data.answer || `I found ${data.count || 0} matching changes.`);
+      setResults(data.rows || []);
+    } catch (err) {
+      setAnswer(friendlyFetchError(err));
+      setResults([]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 650, marginBottom: 6 }}>Ask about the comparison</div>
+        <div style={{ color: "#667085", fontSize: 13, marginBottom: 10 }}>
+          Ask about a section, requirement, table row, code, part number, value, or cell-level change.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && ask()}
+            placeholder="Example: Compare PCB 205 from old file with PCB 203 from new file"
+            style={{ flex: 1, padding: "10px 12px", fontSize: 14, border: "1px solid #c9c0b0", borderRadius: 7, background: "white" }}
+          />
+          <button onClick={ask} disabled={busy} style={primaryButtonStyle(busy)}>
+            {busy ? "Searching" : "Ask"}
+          </button>
+        </div>
+      </div>
+
+      {answer && (
+        <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: "4px solid #2f5f4f", borderRadius: 8, padding: 12, marginBottom: 12, color: "#344054", fontWeight: 600 }}>
+          {answer}
+        </div>
+      )}
+
+      {results && (
+        <div>
+          <div style={{ marginBottom: 8, color: "#667085", fontWeight: 600 }}>
+            {results.length} supporting result{results.length === 1 ? "" : "s"}
+          </div>
+          {results.length === 0 && <EmptyState label="No matching changes found." />}
+          {results.slice(0, 50).map((r, i) => <QueryResult key={i} r={r} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueryResult({ r }) {
+  if (r.type === "table_row_comparison") {
+    return <TableRowComparisonResult result={r} />;
+  }
+
+  if (r.type === "table_row") {
+    return <TableRowLookupResult result={r} />;
+  }
+
+  const c = COLORS[r.change_type] || COLORS.MODIFIED;
+
+  return (
+    <div style={{ borderLeft: `4px solid ${c.border}`, background: "#fffdf8", padding: "10px 12px", marginBottom: 8, fontSize: 13, borderRadius: 7, boxShadow: "0 1px 1px rgba(20,20,20,.04)" }}>
+      <div style={{ fontWeight: 650, marginBottom: 5 }}>
+        <ChangeBadge type={r.change_type || "MODIFIED"} />
+        {r.stable_key && <code style={{ marginLeft: 6 }}>{r.stable_key}</code>}
+        <span style={{ color: "#667085", marginLeft: 8 }}>{r.citation || `page ${r.page} - ${r.block_type}`}</span>
+      </div>
+      {r.before && <div style={{ color: COLORS.DELETED.text }}>Before: {trim(r.before, 260)}</div>}
+      {r.after && <div style={{ color: COLORS.ADDED.text }}>After: {trim(r.after, 260)}</div>}
+      {r.field_changes?.length > 0 && <FieldDiffTable rows={r.field_changes} />}
+    </div>
+  );
+}
+
+function TableRowComparisonResult({ result }) {
+  const rows = result.field_changes || [];
+
+  return (
+    <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: `4px solid ${COLORS.MODIFIED.border}`, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontWeight: 650, color: "#1f2937" }}>
+            Table row comparison: <code>{result.row_key}</code>
+          </div>
+          <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>{result.citation}</div>
+        </div>
+        <Confidence value={result.confidence} />
+      </div>
+
+      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <DefinitionBox title="Baseline row" value={result.definition?.base || result.before} />
+        <DefinitionBox title="Revised row" value={result.definition?.target || result.after} />
+      </div>
+
+      {rows.length > 0 ? (
+        <FieldDiffTable rows={rows} />
+      ) : (
+        <div style={{ marginTop: 10 }}>
+          <EmptyState label="No cell-level differences were found for these selected rows." />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TableRowLookupResult({ result }) {
+  return (
+    <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: `4px solid ${COLORS.MATCH.border}`, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+      <div style={{ fontWeight: 650 }}>
+        {result.side === "base" ? "Baseline" : "Revised"} table row: <code>{result.row_key}</code>
+      </div>
+      <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>{result.citation}</div>
+      <DefinitionBox title="Row definition" value={result.definition} />
+      <ValuesTable values={result.values} />
+    </div>
+  );
+}
+
+function TablesList({ runId }) {
+  const [data, setData] = useState(null);
+  const [baseTableId, setBaseTableId] = useState("");
+  const [targetTableId, setTargetTableId] = useState("");
+  const [baseRowKey, setBaseRowKey] = useState("");
+  const [targetRowKey, setTargetRowKey] = useState("");
+  const [diff, setDiff] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API}/runs/${runId}/tables`)
+      .then((r) => r.json())
+      .then(setData)
+      .catch(() => setData({ base: [], target: [] }));
+  }, [runId]);
+
+  const baseTables = data?.base || [];
+  const targetTables = data?.target || [];
+  const baseTable = baseTables.find((t) => t.id === baseTableId);
+  const targetTable = targetTables.find((t) => t.id === targetTableId);
+
+  const compare = async () => {
+    if (!baseTableId || !targetTableId) return;
+    setBusy(true);
+    setDiff(null);
+
+    try {
+      const r = await fetch(`${API}/runs/${runId}/compare-tables`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_table_id: baseTableId,
+          target_table_id: targetTableId,
+          base_row_key: baseRowKey.trim() || null,
+          target_row_key: targetRowKey.trim() || null,
+        }),
+      });
+
+      if (!r.ok) throw new Error(await readResponseError(r));
+      setDiff(await r.json());
+    } catch (err) {
+      setDiff({ error: friendlyFetchError(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!data) return <SoftLoading label="Loading detected tables" />;
+
+  return (
+    <div>
+      <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 14 }}>
+        <div style={{ fontWeight: 650, marginBottom: 4 }}>Compare detected tables</div>
+        <div style={{ color: "#667085", fontSize: 13 }}>
+          Select tables from both documents. Optionally enter row keys such as a code, part number, PCB number, package code, or any phrase from the row.
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <TablePicker title="Baseline document table" value={baseTableId} onChange={setBaseTableId} tables={baseTables} />
+        <TablePicker title="Revised document table" value={targetTableId} onChange={setTargetTableId} tables={targetTables} />
+      </div>
+
+      {(baseTable || targetTable) && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+          <TableInfo table={baseTable} emptyLabel="Select a baseline table to inspect detected rows." />
+          <TableInfo table={targetTable} emptyLabel="Select a revised table to inspect detected rows." />
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 10, alignItems: "end", marginBottom: 14 }}>
+        <RowKeyInput label="Baseline row key" value={baseRowKey} onChange={setBaseRowKey} table={baseTable} placeholder="Optional, e.g. 205 or 44Q" />
+        <RowKeyInput label="Revised row key" value={targetRowKey} onChange={setTargetRowKey} table={targetTable} placeholder="Optional, e.g. 203 or 44Q" />
+        <button onClick={compare} disabled={busy || !baseTableId || !targetTableId} style={primaryButtonStyle(busy || !baseTableId || !targetTableId, { height: 40 })}>
+          {busy ? "Comparing" : "Compare"}
+        </button>
+      </div>
+
+      {diff?.error && <ErrorBox message={diff.error} />}
+
+      {diff && !diff.error && (
+        <TableCompareResult diff={diff} />
+      )}
+    </div>
+  );
+}
+
+function TablePicker({ title, value, onChange, tables }) {
+  return (
+    <div>
+      <label style={{ display: "block", marginBottom: 7, fontSize: 13, color: "#344054", fontWeight: 650 }}>{title}</label>
+      <select value={value} onChange={(e) => onChange(e.target.value)} style={inputStyle}>
+        <option value="">Select a detected table</option>
+        {tables.map((t) => (
+          <option key={t.id} value={t.id}>
+            p{t.page_first} - {t.n_columns}c x {t.n_rows}r - {t.header_preview || t.area || "table"}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function TableInfo({ table, emptyLabel }) {
+  if (!table) return <EmptyState label={emptyLabel} />;
+
+  return (
+    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+        <div>
+          <div style={{ fontWeight: 650 }}>{table.area || "Detected table"}</div>
+          <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>
+            Page {table.page_first} · {table.n_columns} columns · {table.n_rows} rows
+          </div>
+        </div>
+        <code>{table.id?.slice(0, 8)}</code>
+      </div>
+
+      <div style={{ marginTop: 10, color: "#475467", fontSize: 13 }}>
+        <strong style={{ fontWeight: 650 }}>Headers:</strong> {table.header?.slice(0, 8).join(" | ") || "No headers detected"}
+      </div>
+
+      {table.row_keys?.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {table.row_keys.slice(0, 18).map((key, i) => (
+            <span key={`${key}-${i}`} style={{ border: "1px solid #d8d0c3", borderRadius: 999, padding: "2px 7px", fontSize: 12, color: "#475467", background: "#fbfaf6" }}>
+              {trim(key, 28)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RowKeyInput({ label, value, onChange, table, placeholder }) {
+  const listId = `${label.replace(/\s+/g, "-").toLowerCase()}-keys`;
+
+  return (
+    <div>
+      <label style={{ display: "block", marginBottom: 7, fontSize: 13, color: "#344054", fontWeight: 650 }}>{label}</label>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        list={listId}
+        placeholder={placeholder}
+        style={inputStyle}
+      />
+      <datalist id={listId}>
+        {(table?.row_keys || []).slice(0, 150).map((key, i) => (
+          <option key={`${key}-${i}`} value={key} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
+
+function TableCompareResult({ diff }) {
+  const counts = diff.counts || {};
+  const rowDiffs = diff.row_diffs || [];
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+        <TableResultCard label="Baseline table" table={diff.base_table} />
+        <TableResultCard label="Revised table" table={diff.target_table} />
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        <StatChip label="Added rows" value={counts.ADDED || 0} tone="added" />
+        <StatChip label="Deleted rows" value={counts.DELETED || 0} tone="deleted" />
+        <StatChip label="Modified rows" value={counts.MODIFIED || 0} tone="modified" />
+      </div>
+
+      <HeaderAlignment alignment={diff.header_alignment || []} />
+
+      <div style={{ marginTop: 14 }}>
+        <div style={{ marginBottom: 8, color: "#344054", fontWeight: 650 }}>
+          Row comparison results
+        </div>
+        {rowDiffs.length === 0 ? (
+          <EmptyState label="Tables were compared, but no row-level differences were found." />
+        ) : (
+          rowDiffs.slice(0, 120).map((row, i) => <TableRowDiff key={i} row={row} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TableResultCard({ label, table }) {
+  return (
+    <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+      <div style={{ color: "#667085", fontSize: 12, fontWeight: 650 }}>{label}</div>
+      <div style={{ marginTop: 4, fontWeight: 650 }}>{table?.area || "Table"}</div>
+      <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>
+        Page {table?.page_first || "-"} · {table?.n_columns || 0} columns · {table?.n_rows || 0} rows
+      </div>
+    </div>
+  );
+}
+
+function HeaderAlignment({ alignment }) {
+  if (!alignment.length) return null;
+
+  return (
+    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderRadius: 8, padding: 12 }}>
+      <div style={{ fontWeight: 650, marginBottom: 8 }}>Column alignment</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {alignment.slice(0, 40).map((item, i) => {
+          const type = item.status === "matched" ? "MATCH" : item.status === "base_only" ? "DELETED" : "ADDED";
+          return (
+            <span key={i} style={{ border: `1px solid ${COLORS[type].border}`, background: COLORS[type].chip, color: COLORS[type].text, borderRadius: 999, padding: "3px 8px", fontSize: 12 }}>
+              {item.base_col || "new"} {item.target_col && item.base_col !== item.target_col ? `-> ${item.target_col}` : item.target_col && !item.base_col ? item.target_col : ""}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TableRowDiff({ row }) {
+  const type = row.change_type || "MODIFIED";
+  const fieldDiffs = row.field_diffs || [];
+
+  return (
+    <div style={{ background: "#fffdf8", border: "1px solid #ded6c8", borderLeft: `4px solid ${(COLORS[type] || COLORS.MODIFIED).border}`, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div>
+          <ChangeBadge type={type} />
+          <span style={{ marginLeft: 8, fontWeight: 650 }}>{row.key || row.definition || "row"}</span>
+        </div>
+        <span style={{ color: "#667085", fontSize: 13 }}>Match {Math.round((row.match_score || 0) * 100)}%</span>
+      </div>
+
+      <div style={{ marginTop: 8, color: "#475467", fontSize: 13 }}>{row.definition}</div>
+
+      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <DefinitionBox title="Baseline row" value={row.base_row?.definition || row.base_row?.text} />
+        <DefinitionBox title="Revised row" value={row.target_row?.definition || row.target_row?.text} />
+      </div>
+
+      {fieldDiffs.length > 0 && <FieldDiffTable rows={fieldDiffs} />}
+    </div>
+  );
+}
+
+function FieldDiffTable({ rows }) {
+  if (!rows?.length) return null;
+
+  return (
+    <div style={{ overflowX: "auto", marginTop: 10 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <thead>
+          <tr style={{ background: "#f2eee6", color: "#344054" }}>
+            <th style={smallTh}>Field</th>
+            <th style={smallTh}>Before</th>
+            <th style={smallTh}>After</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              <td style={smallTd}>{r.field || "-"}</td>
+              <td style={{ ...smallTd, color: COLORS.DELETED.text }}>{displayCell(r.before)}</td>
+              <td style={{ ...smallTd, color: COLORS.ADDED.text }}>{displayCell(r.after)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ValuesTable({ values }) {
+  const entries = Object.entries(values || {});
+  if (!entries.length) return null;
+
+  return (
+    <div style={{ overflowX: "auto", marginTop: 10 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <tbody>
+          {entries.slice(0, 30).map(([key, value]) => (
+            <tr key={key}>
+              <td style={{ ...smallTd, width: "28%", color: "#667085" }}>{key}</td>
+              <td style={smallTd}>{displayCell(value)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DefinitionBox({ title, value }) {
+  return (
+    <div style={{ background: "#fbfaf6", border: "1px solid #e0d8ca", borderRadius: 8, padding: 10 }}>
+      <div style={{ fontSize: 12, color: "#667085", fontWeight: 650, marginBottom: 4 }}>{title}</div>
+      <div style={{ fontSize: 13, color: "#344054", lineHeight: 1.4 }}>{value || "-"}</div>
+    </div>
+  );
+}
+
+function ChangeBadge({ type }) {
+  const c = COLORS[type] || COLORS.MODIFIED;
+  return (
+    <span style={{ display: "inline-block", background: c.chip, color: c.text, border: `1px solid ${c.border}`, padding: "2px 8px", borderRadius: 999, fontWeight: 650, fontSize: 12 }}>
+      {type}
+    </span>
+  );
+}
+
 function filterLabel(filter) {
   if (filter === "ALL") return "All changes";
   if (filter === "REVIEW") return "Needs review";
@@ -889,6 +1257,15 @@ function average(values) {
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
+const inputStyle = {
+  width: "100%",
+  padding: "10px 11px",
+  border: "1px solid #c9c0b0",
+  borderRadius: 7,
+  background: "white",
+  color: "#344054",
+};
+
 const th = {
   textAlign: "left",
   padding: "10px 12px",
@@ -903,180 +1280,18 @@ const td = {
   verticalAlign: "top",
 };
 
-function QueryPanel({ runId }) {
-  const [q, setQ] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [results, setResults] = useState(null);
-  const [busy, setBusy] = useState(false);
+const smallTh = {
+  textAlign: "left",
+  padding: "8px 9px",
+  borderBottom: "1px solid #ded6c8",
+  fontWeight: 650,
+};
 
-  const ask = async () => {
-    if (!q.trim()) return;
-    setBusy(true);
-    setAnswer("");
-    setResults(null);
-
-    try {
-      const r = await fetch(`${API}/runs/${runId}/query`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q }),
-      });
-      const data = await r.json();
-      setAnswer(data.answer || `I found ${data.count || 0} matching changes.`);
-      setResults(data.rows || []);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div>
-      <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 12 }}>
-        <div style={{ fontWeight: 650, marginBottom: 6 }}>Ask about the comparison</div>
-        <div style={{ color: "#667085", fontSize: 13, marginBottom: 10 }}>
-          Ask about a feature, requirement, price, date, table, clause, or section.
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && ask()}
-            placeholder="Example: What changed in pricing or availability?"
-            style={{ flex: 1, padding: "10px 12px", fontSize: 14, border: "1px solid #c9c0b0", borderRadius: 7, background: "white" }}
-          />
-          <button onClick={ask} disabled={busy} style={primaryButtonStyle(busy)}>
-            {busy ? "Searching" : "Ask"}
-          </button>
-        </div>
-      </div>
-
-      {answer && (
-        <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: "4px solid #2f5f4f", borderRadius: 8, padding: 12, marginBottom: 12, color: "#344054", fontWeight: 600 }}>
-          {answer}
-        </div>
-      )}
-
-      {results && (
-        <div>
-          <div style={{ marginBottom: 8, color: "#667085", fontWeight: 600 }}>
-            {results.length} supporting row{results.length === 1 ? "" : "s"}
-          </div>
-          {results.length === 0 && <EmptyState label="No matching changes found." />}
-          {results.slice(0, 50).map((r, i) => <QueryResult key={i} r={r} />)}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function QueryResult({ r }) {
-  const c = COLORS[r.change_type] || COLORS.MODIFIED;
-
-  return (
-    <div style={{ borderLeft: `4px solid ${c.border}`, background: "#fffdf8", padding: "10px 12px", marginBottom: 8, fontSize: 13, borderRadius: 7, boxShadow: "0 1px 1px rgba(20, 20, 20, 0.04)" }}>
-      <div style={{ fontWeight: 650, marginBottom: 5 }}>
-        <span style={{ background: c.chip, color: c.text, padding: "1px 7px", marginRight: 6, borderRadius: 999 }}>
-          {r.change_type}
-        </span>
-        {r.stable_key && <code>{r.stable_key}</code>}
-        <span style={{ color: "#667085", marginLeft: 8 }}>
-          {r.citation || `page ${r.page} - ${r.block_type}`}
-        </span>
-      </div>
-      {r.before && <div style={{ color: COLORS.DELETED.text }}>Before: {trim(r.before, 260)}</div>}
-      {r.after && <div style={{ color: COLORS.ADDED.text }}>After: {trim(r.after, 260)}</div>}
-    </div>
-  );
-}
-
-function TablesList({ runId }) {
-  const [data, setData] = useState(null);
-  const [baseSel, setBaseSel] = useState("");
-  const [targetSel, setTargetSel] = useState("");
-  const [diff, setDiff] = useState(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    fetch(`${API}/runs/${runId}/tables`)
-      .then((r) => r.json())
-      .then(setData)
-      .catch(() => setData({ base: [], target: [] }));
-  }, [runId]);
-
-  const compare = async () => {
-    if (!baseSel || !targetSel) return;
-    setBusy(true);
-    setDiff(null);
-
-    try {
-      const r = await fetch(`${API}/runs/${runId}/compare-tables`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_header_query: baseSel, target_header_query: targetSel }),
-      });
-      setDiff(await r.json());
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (!data) return <SoftLoading label="Loading detected tables" />;
-
-  return (
-    <div>
-      <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 14 }}>
-        <div style={{ fontWeight: 650, marginBottom: 4 }}>Compare detected tables</div>
-        <div style={{ color: "#667085", fontSize: 13 }}>
-          Select one table from each document. The current backend compares rows by detected headers and stable keys. The next backend pass will add deeper column and row-definition comparison.
-        </div>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
-        <TablePicker title="Baseline document tables" value={baseSel} onChange={setBaseSel} tables={data.base || []} />
-        <TablePicker title="Revised document tables" value={targetSel} onChange={setTargetSel} tables={data.target || []} />
-      </div>
-
-      <button onClick={compare} disabled={busy || !baseSel || !targetSel} style={primaryButtonStyle(busy || !baseSel || !targetSel)}>
-        {busy ? "Comparing" : "Compare selected tables"}
-      </button>
-
-      {diff && diff.error && <ErrorBox message={diff.error} />}
-
-      {diff && diff.row_diffs && (
-        <div style={{ marginTop: 14 }}>
-          <div style={{ marginBottom: 8, color: "#667085", fontWeight: 600 }}>
-            {diff.row_diffs.length} row change{diff.row_diffs.length === 1 ? "" : "s"}
-          </div>
-          {diff.row_diffs.length === 0 && <EmptyState label="Tables were compared, but no row-level differences were found." />}
-          {diff.row_diffs.slice(0, 100).map((rd, i) => (
-            <div key={i} style={{ fontSize: 13, padding: "9px 10px", borderBottom: "1px solid #e5dfd4", background: i % 2 ? "#fbfaf7" : "white" }}>
-              <span style={{ background: COLORS[rd.change_type]?.chip, color: COLORS[rd.change_type]?.text, padding: "1px 7px", marginRight: 6, borderRadius: 999, fontWeight: 650 }}>
-                {rd.change_type}
-              </span>
-              <code>{rd.key || "-"}</code>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TablePicker({ title, value, onChange, tables }) {
-  return (
-    <div>
-      <h3 style={{ margin: "0 0 8px", fontSize: 15, fontWeight: 650 }}>{title}</h3>
-      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: "100%", padding: "10px 11px", border: "1px solid #c9c0b0", borderRadius: 7, background: "white", color: "#344054" }}>
-        <option value="">Select a detected table</option>
-        {tables.map((t) => (
-          <option key={t.id} value={t.header_preview}>
-            p{t.page_first} - {t.n_columns}c x {t.n_rows}r - {t.header_preview || "table"}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
+const smallTd = {
+  padding: "8px 9px",
+  borderBottom: "1px solid #eee7dc",
+  verticalAlign: "top",
+};
 
 function SoftLoading({ label }) {
   return <div style={{ padding: 20, color: "#667085", fontWeight: 600 }}>{label}</div>;
@@ -1126,6 +1341,13 @@ function secondaryButtonStyle(extra = {}) {
     cursor: "pointer",
     ...extra,
   };
+}
+
+function displayCell(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 function trim(value, limit) {
