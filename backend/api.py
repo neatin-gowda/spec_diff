@@ -723,6 +723,43 @@ def _table_rows(table: Block, blocks: list[Block]) -> list[Block]:
     ]
 
 
+def _table_payload_rows(table: Block) -> list[list[Any]]:
+    payload = _safe_payload(table)
+    rows = payload.get("rows")
+
+    if not isinstance(rows, list):
+        return []
+
+    normalized = []
+    for row in rows:
+        if isinstance(row, list):
+            normalized.append(row)
+        elif isinstance(row, tuple):
+            normalized.append(list(row))
+        elif row is not None:
+            normalized.append([row])
+
+    return normalized
+
+
+def _row_payload_index(row: Optional[Block]) -> Optional[int]:
+    if not row:
+        return None
+
+    if isinstance(row.payload, dict):
+        idx = row.payload.get("__row_index__")
+        if isinstance(idx, int):
+            return idx
+        if isinstance(idx, str) and idx.isdigit():
+            return int(idx)
+
+    m = re.search(r"/row_(\d+)$", row.path or "")
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
 def _row_values(row: Optional[Block]) -> dict[str, Any]:
     if not row or not isinstance(row.payload, dict):
         return {}
@@ -734,6 +771,32 @@ def _row_values(row: Optional[Block]) -> dict[str, Any]:
         if str(key).startswith("__"):
             continue
         out[str(key)] = value
+
+    return out
+
+
+def _row_values_for_table(table: Optional[Block], row: Optional[Block], columns: Optional[list[str]] = None) -> dict[str, Any]:
+    values = _row_values(row)
+    if values:
+        return values
+
+    if not table or not row:
+        return {}
+
+    raw_rows = _table_payload_rows(table)
+    row_idx = _row_payload_index(row)
+
+    if row_idx is None or row_idx < 0 or row_idx >= len(raw_rows):
+        return {}
+
+    raw = raw_rows[row_idx]
+    cols = columns or _column_names(table, _table_rows(table, []))
+    if not cols:
+        cols = [f"Column {i + 1}" for i in range(len(raw))]
+
+    out = {}
+    for idx, col in enumerate(cols):
+        out[col] = raw[idx] if idx < len(raw) else ""
 
     return out
 
@@ -760,6 +823,14 @@ def _column_names(table: Block, rows: list[Block]) -> list[str]:
             if key not in seen:
                 out.append(key)
                 seen.add(key)
+
+    raw_rows = _table_payload_rows(table)
+    max_width = max([len(r) for r in raw_rows] + [0])
+    for idx in range(max_width):
+        name = out[idx] if idx < len(out) and out[idx] else f"Column {idx + 1}"
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
 
     return out
 
@@ -855,6 +926,29 @@ def _row_key(row: Optional[Block], row_columns: Optional[list[str]] = None) -> s
     return _display_text(row.text, 120)
 
 
+def _row_key_for_table(table: Optional[Block], row: Optional[Block], row_columns: Optional[list[str]] = None) -> str:
+    if not row:
+        return ""
+
+    columns = _column_names(table, _table_rows(table, [])) if table else []
+    values = _row_values_for_table(table, row, columns)
+
+    if row_columns:
+        parts = [_display_text(values.get(col), 120) for col in row_columns if _display_text(values.get(col), 120)]
+        if parts:
+            return " | ".join(parts)
+
+    if row.stable_key:
+        return str(row.stable_key).strip()
+
+    for value in values.values():
+        text = _display_text(value, 120)
+        if text:
+            return text
+
+    return _display_text(row.text, 120)
+
+
 def _row_definition(row: Optional[Block], row_columns: Optional[list[str]] = None) -> str:
     if not row:
         return ""
@@ -891,16 +985,53 @@ def _row_definition(row: Optional[Block], row_columns: Optional[list[str]] = Non
     return _display_text(row.text, 260)
 
 
-def _row_summary(row: Block, index: int, columns: Optional[list[str]] = None, row_columns: Optional[list[str]] = None) -> dict:
-    values = _row_values(row)
+def _row_definition_for_table(table: Optional[Block], row: Optional[Block], row_columns: Optional[list[str]] = None) -> str:
+    if not row:
+        return ""
+
+    columns = _column_names(table, _table_rows(table, [])) if table else []
+    values = _row_values_for_table(table, row, columns)
+    parts = []
+
+    source_items = []
+    if row_columns:
+        source_items.extend((col, values.get(col)) for col in row_columns)
+    source_items.extend(values.items())
+
+    seen = set()
+    for key, value in source_items:
+        if key in seen:
+            continue
+        seen.add(key)
+
+        v = str(value or "").strip()
+        if not v:
+            continue
+
+        if _is_generic_column_name(str(key)):
+            parts.append(v)
+        else:
+            parts.append(f"{key}: {v}")
+
+        if len(parts) >= 4:
+            break
+
+    if parts:
+        return " | ".join(parts)
+
+    return _display_text(row.text, 260)
+
+
+def _row_summary(row: Block, index: int, columns: Optional[list[str]] = None, row_columns: Optional[list[str]] = None, table: Optional[Block] = None) -> dict:
+    values = _row_values_for_table(table, row, columns)
     selected_values = {col: values.get(col, "") for col in columns} if columns else values
 
     return {
         "id": str(row.id),
         "row_index": index,
         "stable_key": row.stable_key,
-        "row_key": _row_key(row, row_columns),
-        "definition": _row_definition(row, row_columns),
+        "row_key": _row_key_for_table(table, row, row_columns),
+        "definition": _row_definition_for_table(table, row, row_columns),
         "page": row.page_number,
         "path": row.path,
         "text": _display_text(row.text, 500),
@@ -909,7 +1040,7 @@ def _row_summary(row: Block, index: int, columns: Optional[list[str]] = None, ro
     }
 
 
-def _guess_row_label_columns(columns: list[str], rows: list[Block]) -> list[str]:
+def _guess_row_label_columns(columns: list[str], rows: list[Block], table: Optional[Block] = None) -> list[str]:
     if not columns:
         return []
 
@@ -923,7 +1054,7 @@ def _guess_row_label_columns(columns: list[str], rows: list[Block]) -> list[str]
         numericish = 0
 
         for row in rows[:100]:
-            value = _display_text(_row_values(row).get(col), 160)
+            value = _display_text(_row_values_for_table(table, row, columns).get(col), 160)
             if value:
                 non_empty += 1
                 unique_values.add(value.lower())
@@ -966,7 +1097,7 @@ def _guess_value_columns(columns: list[str], row_columns: list[str]) -> list[str
     return candidates
 
 
-def _column_details(columns: list[str], rows: list[Block]) -> list[dict]:
+def _column_details(columns: list[str], rows: list[Block], table: Optional[Block] = None) -> list[dict]:
     details = []
 
     for col in columns:
@@ -975,7 +1106,7 @@ def _column_details(columns: list[str], rows: list[Block]) -> list[dict]:
         distinct = set()
 
         for row in rows[:120]:
-            value = _display_text(_row_values(row).get(col), 120)
+            value = _display_text(_row_values_for_table(table, row, columns).get(col), 120)
             if not value:
                 continue
 
@@ -1000,7 +1131,7 @@ def _column_details(columns: list[str], rows: list[Block]) -> list[dict]:
 def _table_matrix(table: Block, blocks: list[Block], include_rows: bool = False) -> dict:
     rows = _table_rows(table, blocks)
     columns = _column_names(table, rows)
-    row_label_columns = _guess_row_label_columns(columns, rows)
+    row_label_columns = _guess_row_label_columns(columns, rows, table)
     value_columns = _guess_value_columns(columns, row_label_columns)
     pages = _table_pages(table)
     payload = _safe_payload(table)
@@ -1019,21 +1150,21 @@ def _table_matrix(table: Block, blocks: list[Block], include_rows: bool = False)
         "n_columns": len(columns),
         "n_rows": len(rows),
         "columns": columns,
-        "column_details": _column_details(columns, rows),
+        "column_details": _column_details(columns, rows, table),
         "header": columns,
         "header_preview": header_preview,
         "header_source": payload.get("header_sources", [None])[0] if isinstance(payload.get("header_sources"), list) and payload.get("header_sources") else None,
         "header_quality": round(_column_quality(columns), 2),
         "suggested_row_columns": row_label_columns,
         "suggested_value_columns": value_columns,
-        "row_keys": [_row_key(r, row_label_columns) for r in rows[:150]],
-        "row_preview": [_row_summary(r, i, columns=columns, row_columns=row_label_columns) for i, r in enumerate(rows[:12])],
+        "row_keys": [_row_key_for_table(table, r, row_label_columns) for r in rows[:150]],
+        "row_preview": [_row_summary(r, i, columns=columns, row_columns=row_label_columns, table=table) for i, r in enumerate(rows[:12])],
         "near_texts": payload.get("near_texts", []),
         "source_tables": payload.get("source_tables", []),
     }
 
     if include_rows:
-        matrix["rows"] = [_row_summary(r, i, columns=columns, row_columns=row_label_columns) for i, r in enumerate(rows)]
+        matrix["rows"] = [_row_summary(r, i, columns=columns, row_columns=row_label_columns, table=table) for i, r in enumerate(rows)]
 
     return matrix
 
@@ -1201,9 +1332,16 @@ def _align_columns(base_cols: list[str], target_cols: list[str]) -> list[dict]:
     return alignment
 
 
-def _row_match_score(base_row: Block, target_row: Block, base_row_cols: list[str], target_row_cols: list[str]) -> float:
-    base_key = _norm_text(_row_key(base_row, base_row_cols))
-    target_key = _norm_text(_row_key(target_row, target_row_cols))
+def _row_match_score(
+    base_row: Block,
+    target_row: Block,
+    base_row_cols: list[str],
+    target_row_cols: list[str],
+    base_table: Optional[Block] = None,
+    target_table: Optional[Block] = None,
+) -> float:
+    base_key = _norm_text(_row_key_for_table(base_table, base_row, base_row_cols))
+    target_key = _norm_text(_row_key_for_table(target_table, target_row, target_row_cols))
     base_text = _norm_text(base_row.text)
     target_text = _norm_text(target_row.text)
 
@@ -1219,6 +1357,8 @@ def _align_rows(
     target_rows: list[Block],
     base_row_cols: list[str],
     target_row_cols: list[str],
+    base_table: Optional[Block] = None,
+    target_table: Optional[Block] = None,
 ) -> list[tuple[Optional[Block], Optional[Block], float]]:
     pairs = []
     used_base = set()
@@ -1227,7 +1367,7 @@ def _align_rows(
 
     for base_row in base_rows:
         for target_row in target_rows:
-            score = _row_match_score(base_row, target_row, base_row_cols, target_row_cols)
+            score = _row_match_score(base_row, target_row, base_row_cols, target_row_cols, base_table, target_table)
             if score >= 0.55:
                 scored.append((score, base_row, target_row))
 
@@ -1255,9 +1395,13 @@ def _compare_row_values(
     base_row: Optional[Block],
     target_row: Optional[Block],
     value_alignment: list[dict],
+    base_table: Optional[Block] = None,
+    target_table: Optional[Block] = None,
 ) -> list[dict]:
-    base_values = _row_values(base_row) if base_row else {}
-    target_values = _row_values(target_row) if target_row else {}
+    base_columns = _column_names(base_table, _table_rows(base_table, [])) if base_table else None
+    target_columns = _column_names(target_table, _table_rows(target_table, [])) if target_table else None
+    base_values = _row_values_for_table(base_table, base_row, base_columns) if base_row else {}
+    target_values = _row_values_for_table(target_table, target_row, target_columns) if target_row else {}
     changes = []
 
     if base_row is None:
@@ -1308,15 +1452,15 @@ def _compare_row_values(
     return changes
 
 
-def _row_matches_filter(row: Block, row_columns: list[str], row_filter: Optional[str]) -> bool:
+def _row_matches_filter(row: Block, row_columns: list[str], row_filter: Optional[str], table: Optional[Block] = None, columns: Optional[list[str]] = None) -> bool:
     if not row_filter:
         return True
 
     q = _norm_text(row_filter)
-    values = _row_values(row)
+    values = _row_values_for_table(table, row, columns)
     searchable = " ".join(
         [
-            _row_key(row, row_columns),
+            _row_key_for_table(table, row, row_columns),
             row.text or "",
             " ".join(str(v or "") for v in values.values()),
         ]
@@ -1338,7 +1482,7 @@ def _table_view_payload(
 ) -> dict:
     rows = _table_rows(table, blocks)
     all_columns = _column_names(table, rows)
-    row_columns = _guess_row_label_columns(all_columns, rows)
+    row_columns = _guess_row_label_columns(all_columns, rows, table)
 
     if columns:
         selected_columns = [c for c in columns if c in all_columns]
@@ -1347,17 +1491,17 @@ def _table_view_payload(
 
     filtered_rows = [
         row for row in rows
-        if _row_matches_filter(row, row_columns, row_filter)
+        if _row_matches_filter(row, row_columns, row_filter, table, all_columns)
     ]
 
     output_rows = []
     for idx, row in enumerate(filtered_rows[: max(1, min(limit, 1000))]):
-        values = _row_values(row)
+        values = _row_values_for_table(table, row, all_columns)
         output_rows.append(
             {
                 "row_index": idx,
-                "row_key": _row_key(row, row_columns),
-                "definition": _row_definition(row, row_columns),
+                "row_key": _row_key_for_table(table, row, row_columns),
+                "definition": _row_definition_for_table(table, row, row_columns),
                 "page": row.page_number,
                 "values": {col: values.get(col, "") for col in selected_columns},
             }
@@ -1443,8 +1587,8 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
     base_columns = _column_names(base_table, base_rows)
     target_columns = _column_names(target_table, target_rows)
 
-    base_row_columns = req.base_row_columns or _guess_row_label_columns(base_columns, base_rows)
-    target_row_columns = req.target_row_columns or _guess_row_label_columns(target_columns, target_rows)
+    base_row_columns = req.base_row_columns or _guess_row_label_columns(base_columns, base_rows, base_table)
+    target_row_columns = req.target_row_columns or _guess_row_label_columns(target_columns, target_rows, target_table)
 
     base_value_columns = req.base_value_columns or [c for c in base_columns if c not in base_row_columns]
     target_value_columns = req.target_value_columns or [c for c in target_columns if c not in target_row_columns]
@@ -1464,16 +1608,16 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
             },
         )
 
-    base_rows = [row for row in base_rows if _row_matches_filter(row, base_row_columns, req.row_filter)]
-    target_rows = [row for row in target_rows if _row_matches_filter(row, target_row_columns, req.row_filter)]
+    base_rows = [row for row in base_rows if _row_matches_filter(row, base_row_columns, req.row_filter, base_table, base_columns)]
+    target_rows = [row for row in target_rows if _row_matches_filter(row, target_row_columns, req.row_filter, target_table, target_columns)]
 
     value_alignment = _align_columns(base_value_columns, target_value_columns)
 
     row_results = []
     counts = {"ADDED": 0, "DELETED": 0, "MODIFIED": 0, "UNCHANGED": 0}
 
-    for base_row, target_row, match_score in _align_rows(base_rows, target_rows, base_row_columns, target_row_columns):
-        field_diffs = _compare_row_values(base_row, target_row, value_alignment)
+    for base_row, target_row, match_score in _align_rows(base_rows, target_rows, base_row_columns, target_row_columns, base_table, target_table):
+        field_diffs = _compare_row_values(base_row, target_row, value_alignment, base_table, target_table)
 
         if base_row is None and target_row is not None:
             change_type = "ADDED"
@@ -1497,17 +1641,17 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
                 "change_type": change_type,
                 "match_score": round(match_score, 2),
                 "row_key": {
-                    "base": _row_key(base_row, base_row_columns) if base_row else None,
-                    "target": _row_key(target_row, target_row_columns) if target_row else None,
+                    "base": _row_key_for_table(base_table, base_row, base_row_columns) if base_row else None,
+                    "target": _row_key_for_table(target_table, target_row, target_row_columns) if target_row else None,
                 },
                 "row_definition": {
-                    "base": _row_definition(base_row, base_row_columns) if base_row else None,
-                    "target": _row_definition(target_row, target_row_columns) if target_row else None,
+                    "base": _row_definition_for_table(base_table, base_row, base_row_columns) if base_row else None,
+                    "target": _row_definition_for_table(target_table, target_row, target_row_columns) if target_row else None,
                 },
-                "base_row": _row_summary(base_row, 0, selected_base_columns, base_row_columns) if base_row else None,
-                "target_row": _row_summary(target_row, 0, selected_target_columns, target_row_columns) if target_row else None,
-                "base_values": _row_values(base_row) if base_row else {},
-                "target_values": _row_values(target_row) if target_row else {},
+                "base_row": _row_summary(base_row, 0, selected_base_columns, base_row_columns, base_table) if base_row else None,
+                "target_row": _row_summary(target_row, 0, selected_target_columns, target_row_columns, target_table) if target_row else None,
+                "base_values": _row_values_for_table(base_table, base_row, base_columns) if base_row else {},
+                "target_values": _row_values_for_table(target_table, target_row, target_columns) if target_row else {},
                 "field_diffs": field_diffs,
             }
         )
@@ -1559,8 +1703,8 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
 
     base_columns = _column_names(base_table, base_rows)
     target_columns = _column_names(target_table, target_rows)
-    base_row_columns = _guess_row_label_columns(base_columns, base_rows)
-    target_row_columns = _guess_row_label_columns(target_columns, target_rows)
+    base_row_columns = _guess_row_label_columns(base_columns, base_rows, base_table)
+    target_row_columns = _guess_row_label_columns(target_columns, target_rows, target_table)
 
     if req.base_row_key or req.target_row_key:
         base_row = _find_row(base_rows, req.base_row_key or req.target_row_key, base_row_columns)
@@ -1582,7 +1726,7 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
             [c for c in base_columns if c not in base_row_columns],
             [c for c in target_columns if c not in target_row_columns],
         )
-        field_diffs = _compare_row_values(base_row, target_row, value_alignment)
+        field_diffs = _compare_row_values(base_row, target_row, value_alignment, base_table, target_table)
 
         return {
             "mode": "selected_rows",
@@ -1595,11 +1739,11 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
             "row_diffs": [
                 {
                     "change_type": "MODIFIED" if field_diffs else "UNCHANGED",
-                    "key": _row_key(base_row, base_row_columns),
+                    "key": _row_key_for_table(base_table, base_row, base_row_columns),
                     "match_score": 1.0,
-                    "base_row": _row_summary(base_row, 0),
-                    "target_row": _row_summary(target_row, 0),
-                    "definition": _row_definition(base_row, base_row_columns),
+                    "base_row": _row_summary(base_row, 0, base_columns, base_row_columns, base_table),
+                    "target_row": _row_summary(target_row, 0, target_columns, target_row_columns, target_table),
+                    "definition": _row_definition_for_table(base_table, base_row, base_row_columns),
                     "field_diffs": field_diffs,
                 }
             ] if field_diffs else [],
