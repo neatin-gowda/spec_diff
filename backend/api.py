@@ -1,37 +1,29 @@
 """
 FastAPI app — orchestrates upload, extraction, diff, reports, and queries.
 
-Endpoints:
-  POST /compare                         upload two PDFs, run the full pipeline
-  GET  /runs/{run_id}                   status + stats
-  GET  /runs/{run_id}/diff              list of block diffs
-  GET  /runs/{run_id}/summary           review summary rows
-  POST /runs/{run_id}/query             NL query against the diff
-  GET  /runs/{run_id}/report.pdf        downloadable PDF report
-  GET  /runs/{run_id}/pages/{side}/{n}  rendered page image
-  GET  /runs/{run_id}/overlay/{side}/{n} overlay regions for a page
+The compare flow is asynchronous from the user's perspective:
+  POST /compare              stores files, starts background processing, returns run_id
+  GET  /runs/{run_id}        returns progress/status/result metadata
+
+This avoids browser/proxy timeouts for PDF extraction and LLM summary.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Form
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from .differ_v2 import diff_blocks, diff_stats
 from .extractor_v2 import coverage_pct, extract_blocks_v2 as extract_blocks, render_pages
-from .models import (
-    Block,
-    BlockDiff,
-    ChangeType,
-)
+from .models import Block, ChangeType
 from .query import query as nl_query
 from .report import build_pdf_report
 from .summarizer import summarize
@@ -52,12 +44,116 @@ _RUNS: dict[str, dict] = {}
 
 class CompareResponse(BaseModel):
     run_id: str
-    stats: dict[str, int]
-    coverage: dict[str, float]
+    status: str
+    status_message: str
+    progress: int
+
+
+class QueryReq(BaseModel):
+    question: str
+
+
+class CompareTablesReq(BaseModel):
+    base_header_query: str
+    target_header_query: Optional[str] = None
+
+
+def _set_run_status(run_id: str, message: str, progress: int, status: str = "running") -> None:
+    if run_id not in _RUNS:
+        _RUNS[run_id] = {}
+    _RUNS[run_id].update({
+        "status": status,
+        "status_message": message,
+        "progress": progress,
+    })
+
+
+def _ensure_run(run_id: str) -> dict:
+    r = _RUNS.get(run_id)
+    if not r:
+        raise HTTPException(404, "no such run")
+    return r
+
+
+def _ensure_complete(run_id: str) -> dict:
+    r = _ensure_run(run_id)
+    if r.get("status") == "failed":
+        raise HTTPException(500, r.get("error", "Comparison failed"))
+    if r.get("status") != "complete":
+        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    return r
+
+
+def _process_compare(
+    run_id: str,
+    work: Path,
+    base_pdf: Path,
+    target_pdf: Path,
+    base_label: str,
+    target_label: str,
+    use_llm: bool,
+) -> None:
+    try:
+        _set_run_status(run_id, "Reading document pages", 12)
+
+        base_imgs = render_pages(str(base_pdf), str(work / "pages_base"))
+        target_imgs = render_pages(str(target_pdf), str(work / "pages_target"))
+
+        _set_run_status(run_id, "Finding sections, text, and tables", 32)
+
+        base_blocks = extract_blocks(str(base_pdf))
+        target_blocks = extract_blocks(str(target_pdf))
+
+        _set_run_status(run_id, "Checking extraction coverage", 48)
+
+        cov_b = coverage_pct(str(base_pdf), base_blocks)
+        cov_t = coverage_pct(str(target_pdf), target_blocks)
+
+        _set_run_status(run_id, "Comparing document changes", 62)
+
+        diffs = diff_blocks(base_blocks, target_blocks)
+        stats = diff_stats(diffs)
+
+        _set_run_status(
+            run_id,
+            "Preparing AI review summary" if use_llm else "Preparing review summary",
+            78,
+        )
+
+        summary = summarize(diffs, base_blocks, target_blocks, use_llm=use_llm)
+
+        _RUNS[run_id].update({
+            "status": "complete",
+            "status_message": "Comparison complete",
+            "progress": 100,
+            "work": work,
+            "base_pdf": base_pdf,
+            "target_pdf": target_pdf,
+            "base_label": base_label,
+            "target_label": target_label,
+            "base_imgs": base_imgs,
+            "target_imgs": target_imgs,
+            "base_blocks": base_blocks,
+            "target_blocks": target_blocks,
+            "diffs": diffs,
+            "stats": stats,
+            "summary": summary,
+            "coverage": {"base": cov_b, "target": cov_t},
+        })
+
+    except Exception as exc:
+        _RUNS[run_id].update({
+            "status": "failed",
+            "status_message": "Comparison failed",
+            "progress": _RUNS.get(run_id, {}).get("progress", 0),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        })
 
 
 @app.post("/compare", response_model=CompareResponse)
 async def compare(
+    background_tasks: BackgroundTasks,
     base: UploadFile = File(..., description="Older / previous version PDF"),
     target: UploadFile = File(..., description="Newer / current version PDF"),
     use_llm: bool = Form(False),
@@ -71,87 +167,61 @@ async def compare(
     target_pdf = work / "target.pdf"
 
     _RUNS[run_id] = {
-        "status": "running",
-        "status_message": "Preparing uploaded documents",
+        "status": "queued",
+        "status_message": "Uploading documents",
         "progress": 5,
-    }
-
-    with base_pdf.open("wb") as f:
-        shutil.copyfileobj(base.file, f)
-    with target_pdf.open("wb") as f:
-        shutil.copyfileobj(target.file, f)
-
-    _RUNS[run_id].update({
-        "status_message": "Reading pages",
-        "progress": 15,
-    })
-
-    base_imgs = render_pages(str(base_pdf), str(work / "pages_base"))
-    target_imgs = render_pages(str(target_pdf), str(work / "pages_target"))
-
-    _RUNS[run_id].update({
-        "status_message": "Finding sections and tables",
-        "progress": 35,
-    })
-
-    base_blocks = extract_blocks(str(base_pdf))
-    target_blocks = extract_blocks(str(target_pdf))
-
-    cov_b = coverage_pct(str(base_pdf), base_blocks)
-    cov_t = coverage_pct(str(target_pdf), target_blocks)
-
-    _RUNS[run_id].update({
-        "status_message": "Comparing changes",
-        "progress": 60,
-    })
-
-    diffs = diff_blocks(base_blocks, target_blocks)
-    stats = diff_stats(diffs)
-
-    _RUNS[run_id].update({
-        "status_message": "Preparing review summary",
-        "progress": 78,
-    })
-
-    summary = summarize(diffs, base_blocks, target_blocks, use_llm=use_llm)
-
-    _RUNS[run_id] = {
-        "status": "complete",
-        "status_message": "Comparison complete",
-        "progress": 100,
         "work": work,
-        "base_pdf": base_pdf,
-        "target_pdf": target_pdf,
         "base_label": Path(base.filename).stem,
         "target_label": Path(target.filename).stem,
-        "base_imgs": base_imgs,
-        "target_imgs": target_imgs,
-        "base_blocks": base_blocks,
-        "target_blocks": target_blocks,
-        "diffs": diffs,
-        "stats": stats,
-        "summary": summary,
-        "coverage": {"base": cov_b, "target": cov_t},
+        "base_imgs": [],
+        "target_imgs": [],
+        "stats": {},
+        "coverage": {},
     }
+
+    try:
+        with base_pdf.open("wb") as f:
+            shutil.copyfileobj(base.file, f)
+        with target_pdf.open("wb") as f:
+            shutil.copyfileobj(target.file, f)
+    except Exception as exc:
+        _RUNS[run_id].update({
+            "status": "failed",
+            "status_message": "Could not save uploaded documents",
+            "progress": 0,
+            "error": str(exc),
+        })
+        raise HTTPException(500, "Could not save uploaded documents")
+
+    background_tasks.add_task(
+        _process_compare,
+        run_id,
+        work,
+        base_pdf,
+        target_pdf,
+        Path(base.filename).stem,
+        Path(target.filename).stem,
+        use_llm,
+    )
 
     return CompareResponse(
         run_id=run_id,
-        stats=stats,
-        coverage={"base": cov_b, "target": cov_t},
+        status="queued",
+        status_message="Documents uploaded. Comparison is starting.",
+        progress=5,
     )
 
 
 @app.get("/runs/{run_id}")
 def run_meta(run_id: str):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
+    r = _ensure_run(run_id)
 
     return {
         "run_id": run_id,
-        "status": r.get("status", "complete"),
-        "status_message": r.get("status_message", "Comparison complete"),
-        "progress": r.get("progress", 100),
+        "status": r.get("status", "running"),
+        "status_message": r.get("status_message", "Working"),
+        "progress": r.get("progress", 0),
+        "error": r.get("error"),
         "base_label": r.get("base_label"),
         "target_label": r.get("target_label"),
         "stats": r.get("stats", {}),
@@ -169,11 +239,7 @@ def get_diff(
     stable_key: Optional[str] = None,
     limit: int = 200,
 ):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    r = _ensure_complete(run_id)
 
     base_by_id = {b.id: b for b in r["base_blocks"]}
     target_by_id = {b.id: b for b in r["target_blocks"]}
@@ -219,50 +285,29 @@ def get_diff(
 
 @app.get("/runs/{run_id}/summary")
 def get_summary(run_id: str):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
-
+    r = _ensure_complete(run_id)
     return {"summary": [s.dict() for s in r["summary"]]}
 
 
 @app.get("/runs/{run_id}/report.pdf")
 def get_report_pdf(run_id: str):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
-
+    r = _ensure_complete(run_id)
     pdf_bytes = build_pdf_report(run_id, r)
-    filename = f"spec_diff_report_{run_id}.pdf"
+    filename = f"document_comparison_report_{run_id}.pdf"
 
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
-class QueryReq(BaseModel):
-    question: str
 
 
 @app.post("/runs/{run_id}/query")
 def post_query(run_id: str, req: QueryReq):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    r = _ensure_complete(run_id)
 
     result = nl_query(req.question, r["diffs"], r["base_blocks"], r["target_blocks"])
 
-    # query.py now returns a dict. Keep backward safety if older query.py returns a list.
     if isinstance(result, dict):
         return result
 
@@ -276,9 +321,8 @@ def post_query(run_id: str, req: QueryReq):
 
 @app.get("/runs/{run_id}/pages/{side}/{n}")
 def get_page(run_id: str, side: str, n: int):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
+    r = _ensure_complete(run_id)
+
     if side not in ("base", "target"):
         raise HTTPException(400, "side must be base|target")
 
@@ -307,11 +351,8 @@ def _page_dimensions_for(blocks: list[Block], page_number: int) -> tuple[Optiona
 
 @app.get("/runs/{run_id}/overlay/{side}/{n}")
 def get_overlay(run_id: str, side: str, n: int):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    r = _ensure_complete(run_id)
+
     if side not in ("base", "target"):
         raise HTTPException(400, "side must be base|target")
 
@@ -381,34 +422,9 @@ def get_overlay(run_id: str, side: str, n: int):
     }
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "name": "spec-diff", "endpoints": [
-        "POST /compare",
-        "GET /runs/{id}",
-        "GET /runs/{id}/diff",
-        "GET /runs/{id}/summary",
-        "GET /runs/{id}/report.pdf",
-        "POST /runs/{id}/query",
-        "GET /runs/{id}/pages/{side}/{n}",
-        "GET /runs/{id}/overlay/{side}/{n}",
-        "POST /runs/{id}/compare-tables",
-        "GET /runs/{id}/tables",
-    ]}
-
-
-class CompareTablesReq(BaseModel):
-    base_header_query: str
-    target_header_query: Optional[str] = None
-
-
 @app.post("/runs/{run_id}/compare-tables")
 def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    r = _ensure_complete(run_id)
 
     from .differ_v2 import compare_table_headers
 
@@ -422,11 +438,7 @@ def compare_tables_endpoint(run_id: str, req: CompareTablesReq):
 
 @app.get("/runs/{run_id}/tables")
 def list_tables(run_id: str):
-    r = _RUNS.get(run_id)
-    if not r:
-        raise HTTPException(404, "no such run")
-    if r.get("status") != "complete":
-        raise HTTPException(409, r.get("status_message", "Comparison is still running"))
+    r = _ensure_complete(run_id)
 
     def _summarize(blocks):
         out = []
@@ -456,4 +468,24 @@ def list_tables(run_id: str):
     return {
         "base": _summarize(r["base_blocks"]),
         "target": _summarize(r["target_blocks"]),
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "name": "doculens-ai-agent",
+        "endpoints": [
+            "POST /compare",
+            "GET /runs/{id}",
+            "GET /runs/{id}/diff",
+            "GET /runs/{id}/summary",
+            "GET /runs/{id}/report.pdf",
+            "POST /runs/{id}/query",
+            "GET /runs/{id}/pages/{side}/{n}",
+            "GET /runs/{id}/overlay/{side}/{n}",
+            "POST /runs/{id}/compare-tables",
+            "GET /runs/{id}/tables",
+        ],
     }
