@@ -122,6 +122,11 @@ def _dump_model(obj):
     return obj
 
 
+def _max_block_page(blocks: list[Block]) -> int:
+    pages = [int(getattr(block, "page_number", 1) or 1) for block in blocks or []]
+    return max(pages, default=1)
+
+
 def _set_run_status(run_id: str, message: str, progress: int, status: str = "running") -> None:
     if run_id not in _RUNS:
         _RUNS[run_id] = {}
@@ -307,6 +312,8 @@ def _process_compare(
                 "target_source": target_source,
                 "base_format": source_kind(base_source),
                 "target_format": source_kind(target_source),
+                "base_native_pages": _max_block_page(base_blocks),
+                "target_native_pages": _max_block_page(target_blocks),
                 "base_label": base_label,
                 "target_label": target_label,
                 "base_imgs": base_imgs,
@@ -350,6 +357,7 @@ def root():
             "POST /runs/{id}/ai-summary.pdf",
             "POST /runs/{id}/query",
             "GET /runs/{id}/pages/{side}/{n}",
+            "GET /runs/{id}/native-page/{side}/{n}",
             "GET /runs/{id}/overlay/{side}/{n}",
             "GET /runs/{id}/tables",
             "POST /runs/{id}/table-view",
@@ -472,6 +480,8 @@ def run_meta(run_id: str):
         "db_error": r.get("db_error"),
         "n_pages_base": len(r.get("base_imgs", [])),
         "n_pages_target": len(r.get("target_imgs", [])),
+        "base_native_pages": r.get("base_native_pages") or _max_block_page(r.get("base_blocks", [])),
+        "target_native_pages": r.get("target_native_pages") or _max_block_page(r.get("target_blocks", [])),
     }
 
 
@@ -774,6 +784,134 @@ def get_page(run_id: str, side: str, n: int):
         raise HTTPException(404, "page out of range")
 
     return FileResponse(imgs[n - 1], media_type="image/png")
+
+
+def _native_change_maps(r: dict, side: str) -> tuple[dict[Any, ChangeType], dict[Any, list[dict[str, Any]]]]:
+    change_by_id: dict[Any, ChangeType] = {}
+    fields_by_id: dict[Any, list[dict[str, Any]]] = {}
+
+    for d in r["diffs"]:
+        if d.change_type == ChangeType.UNCHANGED:
+            continue
+
+        if side == "base":
+            if d.change_type == ChangeType.ADDED or not d.base_block_id:
+                continue
+            block_id = d.base_block_id
+        else:
+            if d.change_type == ChangeType.DELETED or not d.target_block_id:
+                continue
+            block_id = d.target_block_id
+
+        change_by_id[block_id] = d.change_type
+        fields_by_id[block_id] = [
+            {"field": fd.field, "before": fd.before, "after": fd.after}
+            for fd in d.field_diffs
+        ]
+
+    return change_by_id, fields_by_id
+
+
+def _native_color(change_type: Optional[ChangeType]) -> str:
+    if change_type == ChangeType.ADDED:
+        return "added"
+    if change_type == ChangeType.DELETED:
+        return "deleted"
+    if change_type == ChangeType.MODIFIED:
+        return "modified"
+    return "unchanged"
+
+
+def _native_block_payload(block: Block) -> dict[str, Any]:
+    payload = _safe_payload(block)
+    out = {}
+
+    for key, value in payload.items():
+        key = str(key)
+        if key in {"page_width", "page_height", "anchors", "__anchors__", "__pages__"}:
+            continue
+        if key.startswith("__") and key not in {"__table_title__", "__table_context__", "__row_index__"}:
+            continue
+        out[key] = value
+
+    return out
+
+
+def _native_row_payload(row: Block, fields_by_id: dict[Any, list[dict[str, Any]]], change_by_id: dict[Any, ChangeType]) -> dict[str, Any]:
+    values = _row_values(row)
+    change_type = change_by_id.get(row.id)
+    return {
+        "id": str(row.id),
+        "type": row.block_type.value,
+        "change_type": change_type.value if change_type else "UNCHANGED",
+        "highlight": _native_color(change_type),
+        "stable_key": row.stable_key,
+        "text": row.text,
+        "values": values,
+        "field_diffs": fields_by_id.get(row.id, []),
+        "row_index": _row_payload_index(row),
+    }
+
+
+@app.get("/runs/{run_id}/native-page/{side}/{n}")
+def get_native_page(run_id: str, side: str, n: int):
+    r = _ensure_complete(run_id)
+
+    if side not in ("base", "target"):
+        raise HTTPException(400, "side must be base|target")
+
+    blocks = r["base_blocks"] if side == "base" else r["target_blocks"]
+    fmt = r.get("base_format") if side == "base" else r.get("target_format")
+    change_by_id, fields_by_id = _native_change_maps(r, side)
+
+    table_ids_on_page = {
+        b.id for b in blocks
+        if b.page_number == n and b.block_type.value == "table"
+    }
+
+    items = []
+    for block in sorted(blocks, key=lambda b: (b.page_number, b.sequence)):
+        if block.page_number != n:
+            continue
+
+        if block.block_type.value == "table_row" and block.parent_id in table_ids_on_page:
+            continue
+
+        change_type = change_by_id.get(block.id)
+        item = {
+            "id": str(block.id),
+            "type": block.block_type.value,
+            "path": block.path,
+            "text": block.text,
+            "stable_key": block.stable_key,
+            "change_type": change_type.value if change_type else "UNCHANGED",
+            "highlight": _native_color(change_type),
+            "payload": _native_block_payload(block),
+            "field_diffs": fields_by_id.get(block.id, []),
+        }
+
+        if block.block_type.value == "table":
+            rows = _table_rows(block, blocks)
+            header = _column_names(block, rows)
+            item["header"] = header
+            item["rows"] = [
+                _native_row_payload(row, fields_by_id, change_by_id)
+                for row in rows
+                if row.page_number == n or row.page_number == block.page_number
+            ]
+
+        items.append(item)
+
+    max_native_page = max([b.page_number for b in blocks], default=1)
+
+    return {
+        "page": n,
+        "side": side,
+        "format": fmt,
+        "viewer": "native",
+        "max_page": max_native_page,
+        "items": items,
+    }
 
 
 def _page_dimensions_for(blocks: list[Block], page_number: int) -> tuple[Optional[float], Optional[float]]:
