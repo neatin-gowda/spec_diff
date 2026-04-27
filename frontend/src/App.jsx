@@ -193,7 +193,7 @@ export default function App() {
     const target = form.get("target");
 
     if (!base || !target || !base.name || !target.name) {
-      setError("Please select both PDF documents before starting.");
+      setError("Please select both documents before starting.");
       return;
     }
 
@@ -343,8 +343,8 @@ function UploadPanel({ onUpload, busy }) {
           alignItems: "stretch",
         }}
       >
-        <FileInput label="Baseline document" helper="Previous, approved, or reference PDF" name="base" disabled={busy} />
-        <FileInput label="Revised document" helper="Latest, proposed, or updated PDF" name="target" disabled={busy} />
+        <FileInput label="Baseline document" helper="Previous, approved, or reference file" name="base" disabled={busy} />
+        <FileInput label="Revised document" helper="Latest, proposed, or updated file" name="target" disabled={busy} />
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <label
@@ -377,7 +377,7 @@ function UploadPanel({ onUpload, busy }) {
 
       <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
         <Capability label="Semantic review" detail="Finds meaningful content changes, not layout-only differences." />
-        <Capability label="Visual evidence" detail="Highlights additions, removals, and modifications on the PDFs." />
+        <Capability label="Visual evidence" detail="Renders uploaded files as PDFs for side-by-side review." />
         <Capability label="Business report" detail="Creates a downloadable PDF report with citations and review items." />
       </div>
     </form>
@@ -414,7 +414,7 @@ function FileInput({ label, helper, name, disabled }) {
         ref={inputRef}
         type="file"
         name={name}
-        accept="application/pdf"
+        accept=".pdf,.doc,.docx,.xls,.xlsx,.xlsm,.csv,.tsv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/tab-separated-values"
         required
         disabled={disabled}
         onClick={(e) => e.stopPropagation()}
@@ -439,7 +439,7 @@ function FileInput({ label, helper, name, disabled }) {
             height: 24,
           }}
         >
-          PDF
+          PDF DOC XLS CSV
         </span>
       </div>
 
@@ -458,7 +458,7 @@ function FileInput({ label, helper, name, disabled }) {
           whiteSpace: "nowrap",
         }}
       >
-        {fileName || "Select PDF"}
+        {fileName || "Select a file"}
       </div>
     </div>
   );
@@ -922,6 +922,25 @@ const AI_PROMPT_PRESETS = [
   },
 ];
 
+const FAST_QUERY_PRESETS = [
+  {
+    label: "Key changes",
+    prompt: "Summarize the key changes with citations",
+  },
+  {
+    label: "Needs review",
+    prompt: "Show changes that need clarification or manual review",
+  },
+  {
+    label: "Table changes",
+    prompt: "Show table row and cell changes",
+  },
+  {
+    label: "Added / deleted",
+    prompt: "List added and deleted items with page evidence",
+  },
+];
+
 function QueryPanel({ runId }) {
   const [q, setQ] = useState(DEFAULT_AI_SUMMARY_PROMPT);
   const [mode, setMode] = useState("ai");
@@ -996,9 +1015,13 @@ function QueryPanel({ runId }) {
       a.remove();
       URL.revokeObjectURL(url);
     } catch (err) {
+      const message = friendlyFetchError(err);
       setResponse((prev) => ({
         ...(prev || {}),
-        ai_error: friendlyFetchError(err),
+        ai_error:
+          message === "Not Found"
+            ? "AI summary PDF export is not available on the current backend revision. Redeploy the backend with the latest api.py, then try again."
+            : message,
       }));
     } finally {
       setDownloadBusy(false);
@@ -1032,20 +1055,26 @@ function QueryPanel({ runId }) {
           </button>
         </div>
 
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          {(mode === "ai" ? AI_PROMPT_PRESETS : FAST_QUERY_PRESETS).map((preset) => (
+            <button
+              key={preset.label}
+              type="button"
+              onClick={() => setQ(preset.prompt)}
+              disabled={busy}
+              style={presetButtonStyle(busy)}
+              title={preset.prompt}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
         {mode === "ai" && (
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-            {AI_PROMPT_PRESETS.map((preset) => (
-              <button
-                key={preset.label}
-                type="button"
-                onClick={() => setQ(preset.prompt)}
-                disabled={busy}
-                style={presetButtonStyle(busy)}
-                title={preset.prompt}
-              >
-                {preset.label}
-              </button>
-            ))}
+            <span style={{ color: "#667085", fontSize: 12 }}>
+              Tip: for PCV/code review, ask for the exact baseline and revised values, for example: compare PCV 133456 with PCV 225376.
+            </span>
           </div>
         )}
 
