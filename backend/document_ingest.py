@@ -5,15 +5,18 @@ This module keeps the rest of the application PDF-compatible while allowing
 users to upload Word, Excel, CSV, and PDF files.
 
 Design:
-  * Every uploaded source is normalized to a PDF for the visual side-by-side
-    viewer and page-image APIs.
+  * Every uploaded source is normalized to a PDF for fallback page rendering,
+    report compatibility, and best-effort visual coordinate matching.
   * Structured comparison blocks are extracted from the original source format
     when that is more reliable than reading the converted PDF:
       - DOCX: headings, paragraphs, lists, and tables
       - XLSX/XLSM: sheets, rows, and cells
       - CSV: rows and cells
-  * Legacy DOC/XLS and unsupported formats are converted to PDF and then use
-    the normal PDF extractor as a fallback.
+  * Legacy DOC/XLS and parser failures are converted to PDF and then use the
+    normal PDF extractor as a fallback.
+
+The frontend can render PDFs through page images + overlays and render
+non-PDF sources through the backend's structured native-page endpoint.
 
 LibreOffice is required in the backend container for non-PDF visual conversion.
 """
