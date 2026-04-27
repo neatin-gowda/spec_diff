@@ -901,14 +901,38 @@ function ReviewReport({ runId }) {
   );
 }
 
+const DEFAULT_AI_SUMMARY_PROMPT = "Summarize key changes as a table with columns Feature, Change, Seek Clarification. Use only the extracted comparison evidence.";
+
+const AI_PROMPT_PRESETS = [
+  {
+    label: "Key changes table",
+    prompt: DEFAULT_AI_SUMMARY_PROMPT,
+  },
+  {
+    label: "Clarifications needed",
+    prompt: "List only the changes that need business clarification. Return a table with columns Feature, Change, Seek Clarification.",
+  },
+  {
+    label: "Executive summary",
+    prompt: "Summarize the most important changes in 3 to 5 concise bullets. Use only extracted comparison evidence.",
+  },
+  {
+    label: "High impact changes",
+    prompt: "Show the highest impact changes only. Return a table with columns Feature, Change, Seek Clarification.",
+  },
+];
+
 function QueryPanel({ runId }) {
-  const [q, setQ] = useState("");
-  const [mode, setMode] = useState("fast");
+  const [q, setQ] = useState(DEFAULT_AI_SUMMARY_PROMPT);
+  const [mode, setMode] = useState("ai");
   const [response, setResponse] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [downloadBusy, setDownloadBusy] = useState(false);
 
   const ask = async () => {
-    if (!q.trim()) return;
+    const effectiveQuestion = q.trim() || (mode === "ai" ? DEFAULT_AI_SUMMARY_PROMPT : "");
+    if (!effectiveQuestion) return;
+
     setBusy(true);
     setResponse(null);
 
@@ -916,7 +940,7 @@ function QueryPanel({ runId }) {
       const r = await fetch(`${API}/runs/${runId}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, mode }),
+        body: JSON.stringify({ question: effectiveQuestion, mode }),
       });
 
       if (!r.ok) throw new Error(await readResponseError(r));
@@ -932,19 +956,67 @@ function QueryPanel({ runId }) {
 
   const rows = response?.rows || [];
   const columns = response?.columns || inferColumns(rows);
+  const responseConfidence = normalizeConfidence(response?.confidence);
+  const canDownloadAiSummary = response?.mode === "ai" && (Boolean(response?.answer) || rows.length > 0);
+
+  const selectMode = (nextMode) => {
+    setMode(nextMode);
+    setResponse(null);
+    if (nextMode === "ai" && !q.trim()) {
+      setQ(DEFAULT_AI_SUMMARY_PROMPT);
+    }
+  };
+
+  const downloadAiSummary = async () => {
+    if (!canDownloadAiSummary || downloadBusy) return;
+    setDownloadBusy(true);
+
+    try {
+      const r = await fetch(`${API}/runs/${runId}/ai-summary.pdf`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "AI Summary",
+          answer: response?.answer || "",
+          columns,
+          rows,
+          confidence: response?.confidence ?? null,
+        }),
+      });
+
+      if (!r.ok) throw new Error(await readResponseError(r));
+
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ai_summary_${runId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setResponse((prev) => ({
+        ...(prev || {}),
+        ai_error: friendlyFetchError(err),
+      }));
+    } finally {
+      setDownloadBusy(false);
+    }
+  };
 
   return (
     <div>
       <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 12 }}>
         <div style={{ fontWeight: 650, marginBottom: 6 }}>Ask about the comparison</div>
         <div style={{ color: "#667085", fontSize: 13, marginBottom: 10 }}>
-          Use fast query for exact evidence lookup, or AI Summarization to call Azure OpenAI using extracted and vector-ranked context.
+          Use fast query for exact evidence lookup, or AI Summarization for a business-ready answer from extracted and ranked comparison evidence.
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
           <button
             type="button"
-            onClick={() => setMode("fast")}
+            onClick={() => selectMode("fast")}
             disabled={busy}
             style={modeButtonStyle(mode === "fast", busy)}
           >
@@ -952,13 +1024,30 @@ function QueryPanel({ runId }) {
           </button>
           <button
             type="button"
-            onClick={() => setMode("ai")}
+            onClick={() => selectMode("ai")}
             disabled={busy}
             style={modeButtonStyle(mode === "ai", busy)}
           >
             AI Summarization
           </button>
         </div>
+
+        {mode === "ai" && (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            {AI_PROMPT_PRESETS.map((preset) => (
+              <button
+                key={preset.label}
+                type="button"
+                onClick={() => setQ(preset.prompt)}
+                disabled={busy}
+                style={presetButtonStyle(busy)}
+                title={preset.prompt}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: 8 }}>
           <input
@@ -967,7 +1056,7 @@ function QueryPanel({ runId }) {
             onKeyDown={(e) => e.key === "Enter" && ask()}
             placeholder={
               mode === "ai"
-                ? "Example: Create a Feature, Change, Seek Clarification table with citations"
+                ? DEFAULT_AI_SUMMARY_PROMPT
                 : "Example: Find changes for PCV 205 or summarize key changes"
             }
             style={{ ...inputStyle, flex: 1 }}
@@ -979,12 +1068,25 @@ function QueryPanel({ runId }) {
       </div>
 
       {response?.answer && (
-        <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: "4px solid #2f5f4f", borderRadius: 8, padding: 12, marginBottom: 12, color: "#344054", lineHeight: 1.45 }}>
+        <div dir="auto" style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: "4px solid #2f5f4f", borderRadius: 8, padding: 12, marginBottom: 12, color: "#344054", lineHeight: 1.45 }}>
           {response.mode && (
-            <div style={{ color: "#667085", fontSize: 12, fontWeight: 650, marginBottom: 6 }}>
-              {response.mode === "ai" ? "AI Summarization" : "Natural language query"}
-              {response.ai_called === true ? " - Azure OpenAI called" : ""}
-              {response.ai_unavailable ? " - Azure OpenAI unavailable" : ""}
+            <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", marginBottom: 6 }}>
+              <div style={{ color: "#667085", fontSize: 12, fontWeight: 650 }}>
+                {response.mode === "ai" ? "AI Summarization" : "Natural language query"}
+                {response.mode === "ai" && response.ai_called === true ? " - Successful" : ""}
+                {response.mode === "ai" && response.ai_unavailable ? " - Unavailable" : ""}
+                {response.mode === "ai" && typeof responseConfidence === "number" ? ` | Confidence ${Math.round(responseConfidence * 100)}%` : ""}
+              </div>
+              {canDownloadAiSummary && (
+                <button
+                  type="button"
+                  onClick={downloadAiSummary}
+                  disabled={downloadBusy}
+                  style={secondaryButtonStyle(downloadBusy ? { opacity: 0.65, cursor: "default" } : {})}
+                >
+                  {downloadBusy ? "Preparing PDF" : "Download AI summary"}
+                </button>
+              )}
             </div>
           )}
           {response.answer}
@@ -1561,13 +1663,13 @@ function GenericRowsTable({ columns, rows }) {
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 780 }}>
         <thead>
           <tr style={{ background: "#1f2937", color: "white" }}>
-            {columns.map((col) => <th key={col} style={th}>{col}</th>)}
+            {columns.map((col) => <th key={col} dir="auto" style={th}>{col}</th>)}
           </tr>
         </thead>
         <tbody>
           {rows.slice(0, 200).map((row, i) => (
             <tr key={i}>
-              {columns.map((col) => <td key={col} style={td}>{displayCell(row[col])}</td>)}
+              {columns.map((col) => <td key={col} dir="auto" style={td}>{displayCell(row[col])}</td>)}
             </tr>
           ))}
         </tbody>
@@ -1872,6 +1974,20 @@ function modeButtonStyle(active, disabled = false) {
     cursor: disabled ? "default" : "pointer",
     fontWeight: 600,
     opacity: disabled ? 0.7 : 1,
+  };
+}
+
+function presetButtonStyle(disabled = false) {
+  return {
+    border: "1px solid #d8d0c3",
+    background: "#fffdf8",
+    color: "#344054",
+    borderRadius: 999,
+    padding: "6px 10px",
+    cursor: disabled ? "default" : "pointer",
+    fontWeight: 550,
+    fontSize: 12,
+    opacity: disabled ? 0.65 : 1,
   };
 }
 
