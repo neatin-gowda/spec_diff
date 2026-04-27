@@ -17,7 +17,8 @@ const COLORS = {
 
 const css = `
   * { box-sizing: border-box; }
-  body { margin: 0; }
+  html, body, #root { min-height: 100%; }
+  body { margin: 0; overflow-x: hidden; }
   button, input, select, textarea { font: inherit; }
   button { transition: background .15s ease, border-color .15s ease, color .15s ease, opacity .15s ease, transform .15s ease; }
   button:not(:disabled):hover { transform: translateY(-1px); }
@@ -61,6 +62,70 @@ const css = `
   }
   .grid-safe {
     min-width: 0;
+  }
+  .viewer-grid {
+    align-items: start;
+    min-width: 0;
+  }
+  .viewer-grid > * {
+    min-width: 0;
+  }
+  .doc-viewer-shell {
+    min-width: 0;
+  }
+  .doc-frame {
+    position: relative;
+    border: 1px solid #b7ae9f;
+    background: #f9f6ef;
+    min-height: 520px;
+    max-height: min(78vh, 940px);
+    overflow: hidden;
+  }
+  .doc-frame.native {
+    overflow: auto;
+    background: #f7f2e9;
+  }
+  .native-page {
+    width: 100%;
+    min-width: 0;
+    min-height: 520px;
+    padding: 14px;
+    color: #1f2937;
+  }
+  .native-page.document {
+    max-width: 860px;
+    margin: 0 auto;
+    background: #fffdf8;
+    box-shadow: 0 1px 4px rgba(31,41,55,.08);
+  }
+  .native-page.spreadsheet {
+    min-width: 100%;
+    background: #fffdf8;
+  }
+  .native-block {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .native-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid #e9dfd0;
+    border-radius: 6px;
+    background: #fffdf8;
+  }
+  .native-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+  .native-table.spreadsheet {
+    table-layout: auto;
+    min-width: 720px;
+  }
+  .native-table th,
+  .native-table td {
+    overflow-wrap: anywhere;
+    vertical-align: top;
   }
   .table-selected-stack {
     display: grid;
@@ -110,6 +175,9 @@ const css = `
       grid-template-columns: 1fr !important;
     }
     .header-actions { justify-content: flex-start !important; }
+    .doc-frame {
+      max-height: 72vh;
+    }
   }
 `;
 
@@ -623,7 +691,7 @@ function SideBySide({ runId, meta, pageNum, setPageNum }) {
         <Legend />
       </div>
 
-      <div className="viewer-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+      <div className="viewer-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 14 }}>
         <PageView
           runId={runId}
           side="base"
@@ -725,7 +793,7 @@ function PageView({ runId, side, pageNum, setPageNum, totalPages, label, docName
   }, [runId, side, pageNum, pageExists, useNativeViewer]);
 
   return (
-    <div>
+    <div className="doc-viewer-shell">
       <div style={{ marginBottom: 7, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
         <div>
           <div style={{ fontSize: 13, color: "#667085", fontWeight: 600 }}>{label}</div>
@@ -759,7 +827,7 @@ function PageView({ runId, side, pageNum, setPageNum, totalPages, label, docName
         </div>
       </div>
 
-      <div style={{ position: "relative", border: "1px solid #b7ae9f", background: "#f9f6ef", minHeight: 520, overflow: useNativeViewer ? "auto" : "hidden" }}>
+      <div className={`doc-frame dl-scrollbar ${useNativeViewer ? "native" : ""}`}>
         {!pageExists ? (
           <EmptyPage pageNum={pageNum} />
         ) : useNativeViewer ? (
@@ -836,6 +904,7 @@ function NativePageView({ page }) {
   }
 
   const items = page.items || [];
+  const viewerType = page.viewer_type || (page.format === "spreadsheet" ? "spreadsheet" : "document");
 
   if (!items.length) {
     return (
@@ -846,55 +915,57 @@ function NativePageView({ page }) {
   }
 
   return (
-    <div dir="auto" style={{ padding: 16, background: "#fffdf8", minHeight: 520, color: "#1f2937" }}>
+    <div className={`native-page ${viewerType}`} dir="auto">
       {items.map((item) => (
-        <NativeItem key={item.id} item={item} />
+        <NativeItem key={item.id} item={item} viewerType={viewerType} />
       ))}
     </div>
   );
 }
 
-function NativeItem({ item }) {
+function NativeItem({ item, viewerType }) {
   const highlight = nativeHighlightStyle(item.highlight);
 
   if (item.type === "table") {
-    return <NativeTable item={item} />;
+    return <NativeTable item={item} viewerType={viewerType} />;
   }
 
   const isHeading = item.type === "section" || item.type === "heading";
 
   return (
     <div
+      className="native-block"
       dir="auto"
       style={{
         ...highlight,
         marginBottom: isHeading ? 10 : 8,
-        padding: isHeading ? "8px 10px" : "7px 9px",
+        padding: isHeading ? "7px 9px" : "6px 8px",
         borderRadius: 6,
-        fontSize: isHeading ? 15 : 13,
+        fontSize: isHeading ? 14 : 13,
         fontWeight: isHeading ? 650 : 400,
         lineHeight: 1.45,
       }}
       title={item.change_type}
     >
       {item.text || item.payload?.text || item.path || "-"}
-      {Array.isArray(item.field_diffs) && item.field_diffs.length > 0 && (
-        <FieldDiffTable rows={item.field_diffs} />
-      )}
     </div>
   );
 }
 
-function NativeTable({ item }) {
+function NativeTable({ item, viewerType }) {
   const header = item.header || [];
   const rows = item.rows || [];
   const title = item.payload?.table_title || item.text || "Table";
+  const isSpreadsheet = viewerType === "spreadsheet";
 
   return (
-    <div dir="auto" style={{ ...nativeHighlightStyle(item.highlight), marginBottom: 14, padding: 10, borderRadius: 7 }}>
-      <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 7, color: "#344054" }}>{title}</div>
-      <div className="dl-scrollbar" style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: Math.max(520, header.length * 130) }}>
+    <div className="native-block" dir="auto" style={{ ...nativeHighlightStyle(item.highlight), marginBottom: 14, padding: 10, borderRadius: 7 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap", marginBottom: 7 }}>
+        <div style={{ fontSize: 14, fontWeight: 650, color: "#344054" }}>{title}</div>
+        <div style={{ fontSize: 11, color: "#667085" }}>{rows.length} row{rows.length === 1 ? "" : "s"}</div>
+      </div>
+      <div className="native-table-wrap dl-scrollbar">
+        <table className={`native-table ${isSpreadsheet ? "spreadsheet" : ""}`} style={{ fontSize: isSpreadsheet ? 12 : 12 }}>
           <thead>
             <tr style={{ background: "#f2eee6", color: "#344054" }}>
               {header.map((col) => (
@@ -925,21 +996,21 @@ function NativeTable({ item }) {
 function nativeHighlightStyle(kind, compact = false) {
   if (kind === "added") {
     return {
-      background: compact ? COLORS.ADDED.bg : "rgba(222, 247, 225, 0.72)",
+      background: compact ? COLORS.ADDED.bg : "rgba(31,160,70,.08)",
       border: compact ? undefined : `1px solid ${COLORS.ADDED.border}`,
       borderLeft: `3px solid ${COLORS.ADDED.border}`,
     };
   }
   if (kind === "deleted") {
     return {
-      background: compact ? COLORS.DELETED.bg : "rgba(255, 226, 226, 0.74)",
+      background: compact ? COLORS.DELETED.bg : "rgba(218,54,54,.08)",
       border: compact ? undefined : `1px solid ${COLORS.DELETED.border}`,
       borderLeft: `3px solid ${COLORS.DELETED.border}`,
     };
   }
   if (kind === "modified") {
     return {
-      background: compact ? COLORS.MODIFIED.bg : "rgba(249, 240, 181, 0.68)",
+      background: compact ? COLORS.MODIFIED.bg : "rgba(218,185,42,.11)",
       border: compact ? undefined : `1px solid ${COLORS.MODIFIED.border}`,
       borderLeft: `3px solid ${COLORS.MODIFIED.border}`,
     };
@@ -1054,42 +1125,41 @@ const AI_PROMPT_PRESETS = [
     prompt: DEFAULT_AI_SUMMARY_PROMPT,
   },
   {
-    label: "Clarifications needed",
-    prompt: "List only the changes that need business clarification. Return a table with columns Feature, Change, Seek Clarification.",
-  },
-  {
     label: "Executive summary",
-    prompt: "Summarize the most important changes in 3 to 5 concise bullets. Use only extracted comparison evidence.",
+    prompt: "Write a concise executive summary of the most important document changes. Group related changes and include evidence references where useful.",
   },
   {
-    label: "High impact changes",
-    prompt: "Show the highest impact changes only. Return a table with columns Feature, Change, Seek Clarification.",
+    label: "High-risk changes",
+    prompt: "Identify high-risk changes such as dates, prices, obligations, requirements, removals, availability, or table cell changes. Explain why each item may need review.",
+  },
+  {
+    label: "Clarification list",
+    prompt: "List the changes that should be checked with the relevant owner or team. For each item, explain the exact clarification question to ask.",
   },
 ];
 
 const FAST_QUERY_PRESETS = [
   {
-    label: "Key changes",
+    label: "Evidence summary",
     prompt: "Summarize the key changes with citations",
   },
   {
-    label: "Needs review",
-    prompt: "Show changes that need clarification or manual review",
+    label: "Removed content",
+    prompt: "List content that was deleted or removed with page evidence",
   },
   {
     label: "Table changes",
     prompt: "Show table row and cell changes",
   },
   {
-    label: "Added / deleted",
-    prompt: "List added and deleted items with page evidence",
+    label: "Numbers and dates",
+    prompt: "Show changes involving numbers, dates, prices, percentages, or codes",
   },
 ];
 
 function QueryPanel({ runId }) {
   const [q, setQ] = useState(DEFAULT_AI_SUMMARY_PROMPT);
   const [mode, setMode] = useState("ai");
-  const [responseLanguage, setResponseLanguage] = useState("source");
   const [response, setResponse] = useState(null);
   const [busy, setBusy] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState(false);
@@ -1105,7 +1175,7 @@ function QueryPanel({ runId }) {
       const r = await fetch(`${API}/runs/${runId}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: effectiveQuestion, mode, response_language: responseLanguage }),
+        body: JSON.stringify({ question: effectiveQuestion, mode, response_language: "source" }),
       });
 
       if (!r.ok) throw new Error(await readResponseError(r));
@@ -1199,27 +1269,6 @@ function QueryPanel({ runId }) {
           >
             AI Summarization
           </button>
-        </div>
-
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
-          <label style={{ color: "#667085", fontSize: 13, fontWeight: 600 }}>Response language</label>
-          <select
-            value={responseLanguage}
-            onChange={(e) => {
-              setResponseLanguage(e.target.value);
-              setResponse(null);
-            }}
-            disabled={busy}
-            style={{ ...inputStyle, width: 230, padding: "7px 9px" }}
-          >
-            <option value="source">Keep source language</option>
-            <option value="english">English</option>
-            <option value="arabic">Arabic</option>
-            <option value="bilingual">Bilingual source + English</option>
-          </select>
-          <span style={{ color: "#667085", fontSize: 12 }}>
-            Source text, table values, codes, and names are preserved as extracted.
-          </span>
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
