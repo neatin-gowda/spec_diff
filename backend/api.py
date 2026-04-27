@@ -14,6 +14,7 @@ Table intelligence:
 from __future__ import annotations
 
 import re
+import json
 import shutil
 import tempfile
 import threading
@@ -364,6 +365,7 @@ def root():
             "POST /runs/{id}/table-view",
             "POST /runs/{id}/compare-tables",
             "POST /runs/{id}/compare-table-columns",
+            "POST /runs/{id}/table-report.pdf",
         ],
         "supported_upload_formats": supported_input_extensions(),
     }
@@ -1886,6 +1888,55 @@ def _compare_row_values(
     return changes
 
 
+def _table_review_rows(row_results: list[dict], limit: int = 25) -> list[dict]:
+    review_rows = []
+
+    for row in row_results[:limit]:
+        change_type = str(row.get("change_type") or "MODIFIED").upper()
+        row_key = row.get("row_key") if isinstance(row.get("row_key"), dict) else {}
+        row_definition = row.get("row_definition") if isinstance(row.get("row_definition"), dict) else {}
+        feature = (
+            row_key.get("base")
+            or row_key.get("target")
+            or row_definition.get("base")
+            or row_definition.get("target")
+            or "Table row"
+        )
+        field_diffs = row.get("field_diffs") or []
+
+        if change_type == "ADDED":
+            change = f"New row/value appears in the revised table: {feature}"
+            clarification = "Confirm whether this newly added table entry is expected and applicable."
+        elif change_type == "DELETED":
+            change = f"Baseline row/value is no longer present in the revised table: {feature}"
+            clarification = "Confirm whether this removed table entry is intentionally discontinued or moved."
+        elif field_diffs:
+            examples = []
+            for fd in field_diffs[:3]:
+                field = fd.get("field") or "value"
+                before = str(fd.get("before") or "-")
+                after = str(fd.get("after") or "-")
+                examples.append(f"{field}: {before} -> {after}")
+            change = "; ".join(examples)
+            clarification = "Confirm the selected table value changes with the responsible owner."
+        else:
+            change = "No selected value change detected."
+            clarification = "No clarification required for the selected columns."
+
+        match_score = row.get("match_score")
+        review_rows.append(
+            {
+                "Feature": str(feature),
+                "Change": change,
+                "Seek Clarification": clarification,
+                "Change Type": change_type,
+                "Confidence": f"{round(float(match_score) * 100)}%" if match_score is not None else "-",
+            }
+        )
+
+    return review_rows
+
+
 def _row_matches_filter(row: Block, row_columns: list[str], row_filter: Optional[str], table: Optional[Block] = None, columns: Optional[list[str]] = None) -> bool:
     if not row_filter:
         return True
@@ -2027,6 +2078,11 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
     base_value_columns = req.base_value_columns or [c for c in base_columns if c not in base_row_columns]
     target_value_columns = req.target_value_columns or [c for c in target_columns if c not in target_row_columns]
 
+    base_row_columns = list(dict.fromkeys(base_row_columns))
+    target_row_columns = list(dict.fromkeys(target_row_columns))
+    base_value_columns = [c for c in dict.fromkeys(base_value_columns) if c not in base_row_columns]
+    target_value_columns = [c for c in dict.fromkeys(target_value_columns) if c not in target_row_columns]
+
     invalid_base = [c for c in base_row_columns + base_value_columns if c not in base_columns]
     invalid_target = [c for c in target_row_columns + target_value_columns if c not in target_columns]
 
@@ -2093,12 +2149,21 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
         if len(row_results) >= max(1, min(req.limit, 1000)):
             break
 
+    review_rows = _table_review_rows(row_results)
+
     return {
         "view": "table_comparison",
         "answer": (
             f"Compared {len(base_rows)} baseline row(s) with {len(target_rows)} revised row(s). "
             f"Found {counts['ADDED']} added, {counts['DELETED']} deleted, and {counts['MODIFIED']} modified row(s)."
         ),
+        "review_summary": (
+            f"Selected table slice review: {counts['ADDED']} added, {counts['DELETED']} deleted, "
+            f"{counts['MODIFIED']} modified, and {counts['UNCHANGED']} unchanged aligned row(s). "
+            "Use the review rows below to confirm business impact with the responsible owner."
+        ),
+        "review_columns": ["Feature", "Change", "Seek Clarification", "Change Type", "Confidence"],
+        "review_rows": review_rows,
         "base_table": _table_matrix(base_table, r["base_blocks"], include_rows=False),
         "target_table": _table_matrix(target_table, r["target_blocks"], include_rows=False),
         "base_preview": _table_view_payload(base_table, r["base_blocks"], base_row_columns + base_value_columns, req.row_filter, limit=30),
@@ -2112,6 +2177,135 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
         "rows": row_results,
         "row_diffs": row_results,
     }
+
+
+@app.post("/runs/{run_id}/table-report.pdf")
+def table_report_pdf(run_id: str, req: CompareTableColumnsReq):
+    try:
+        from html import escape
+
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception as exc:
+        raise HTTPException(500, f"Table PDF generation is not available: {exc}")
+
+    result = compare_table_columns(run_id, req)
+
+    font_name = "Helvetica"
+    for font_path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ):
+        try:
+            if Path(font_path).exists():
+                pdfmetrics.registerFont(TTFont("DocuLensTableUnicode", font_path))
+                font_name = "DocuLensTableUnicode"
+                break
+        except Exception:
+            font_name = "Helvetica"
+
+    def _cell(value: Any, limit: int = 500) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            text = str(value)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:limit] + "..." if len(text) > limit else text
+
+    page_size = landscape(A4)
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=page_size,
+        leftMargin=0.42 * inch,
+        rightMargin=0.42 * inch,
+        topMargin=0.42 * inch,
+        bottomMargin=0.42 * inch,
+        title=f"Table comparison - {run_id}",
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TableReportTitle", parent=styles["Title"], fontName=font_name, fontSize=15, leading=18, textColor=colors.HexColor("#1f2937"))
+    meta_style = ParagraphStyle("TableReportMeta", parent=styles["BodyText"], fontName=font_name, fontSize=8, leading=10, textColor=colors.HexColor("#667085"))
+    body_style = ParagraphStyle("TableReportBody", parent=styles["BodyText"], fontName=font_name, fontSize=8.2, leading=10.5, textColor=colors.HexColor("#344054"))
+    header_style = ParagraphStyle("TableReportHeader", parent=body_style, fontName=font_name, textColor=colors.white)
+
+    story = [
+        Paragraph("Selected Table Comparison Report", title_style),
+        Paragraph(escape(f"Run ID: {run_id}"), meta_style),
+        Spacer(1, 6),
+        Paragraph(escape(result.get("answer") or "Selected table comparison"), body_style),
+        Paragraph(escape(result.get("review_summary") or ""), body_style),
+        Spacer(1, 8),
+    ]
+
+    def _add_table(title: str, columns: list[str], rows: list[dict], max_rows: int = 80):
+        story.append(Paragraph(escape(title), body_style))
+        if not columns or not rows:
+            story.append(Paragraph("No rows available for this selection.", body_style))
+            story.append(Spacer(1, 6))
+            return
+
+        usable_width = page_size[0] - doc.leftMargin - doc.rightMargin
+        col_width = usable_width / max(1, len(columns))
+        data = [[Paragraph(escape(str(col)), header_style) for col in columns]]
+        for row in rows[:max_rows]:
+            data.append([Paragraph(escape(_cell(row.get(col))).replace("\n", "<br/>"), body_style) for col in columns])
+
+        table = Table(data, colWidths=[col_width] * len(columns), repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, -1), font_name),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#ded6c8")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fbfaf6")]),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        story.append(table)
+        story.append(Spacer(1, 9))
+
+    _add_table("Review and Clarification Summary", result.get("review_columns") or [], result.get("review_rows") or [], max_rows=60)
+
+    diff_rows = []
+    for row in (result.get("rows") or [])[:100]:
+        row_key = row.get("row_key") if isinstance(row.get("row_key"), dict) else {}
+        diff_rows.append(
+            {
+                "Change Type": row.get("change_type"),
+                "Baseline Row": row_key.get("base"),
+                "Revised Row": row_key.get("target"),
+                "Changed Values": "; ".join(
+                    f"{fd.get('field')}: {fd.get('before') or '-'} -> {fd.get('after') or '-'}"
+                    for fd in (row.get("field_diffs") or [])[:4]
+                ) or "-",
+                "Match": f"{round(float(row.get('match_score') or 0) * 100)}%",
+            }
+        )
+    _add_table("Compared Row Changes", ["Change Type", "Baseline Row", "Revised Row", "Changed Values", "Match"], diff_rows, max_rows=100)
+
+    doc.build(story)
+    filename = f"table_comparison_{run_id}.pdf"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/runs/{run_id}/compare-tables")
