@@ -30,7 +30,7 @@ from .anchors import (
     find_anchored_terms,
     find_anchors,
 )
-from .image_text import extract_image_text, ocr_full_page
+from .image_text import extract_image_text, is_scanned_page, ocr_full_page
 from .models import Block, BlockType, TemplateProfile
 from .table_extractor import extract_tables_robust
 from .table_stitcher import stitch_tables
@@ -422,6 +422,67 @@ def _collect_lines_with_filter(pdf_path: str) -> list[_Line]:
     return _collect_lines(pdf_path)
 
 
+def _ocr_line_blocks(
+    pdf_path: str,
+    page_number: int,
+    page_width: float,
+    page_height: float,
+    start_sequence: int,
+    defined_terms: Optional[set[str]] = None,
+) -> tuple[list[Block], int]:
+    """
+    Build searchable/highlightable blocks from page OCR.
+
+    Full-page OCR is intentionally split into approximate line blocks. A single
+    full-page OCR block would compare correctly, but it would also paint the
+    whole page as changed. These line-sized boxes give the viewer a useful
+    highlight target even when the PDF content is scanned/image-based.
+    """
+    text = ocr_full_page(pdf_path, page_number)
+    raw_lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    ocr_lines = [line for line in raw_lines if line]
+
+    if not ocr_lines:
+        return [], start_sequence
+
+    blocks: list[Block] = []
+    seq = start_sequence
+    top_margin = max(24.0, page_height * 0.04)
+    bottom_margin = max(24.0, page_height * 0.04)
+    usable_height = max(1.0, page_height - top_margin - bottom_margin)
+    line_slot = max(8.0, usable_height / max(1, len(ocr_lines)))
+
+    for idx, line in enumerate(ocr_lines):
+        y0 = top_margin + idx * line_slot
+        y1 = min(page_height - bottom_margin, y0 + min(18.0, line_slot * 0.85))
+        anchors = find_anchors(line)
+        if defined_terms:
+            anchors += find_anchored_terms(line, defined_terms)
+        payload = {
+            "text": line,
+            "ocr": True,
+            "ocr_source": "full_page",
+            "ocr_line_index": idx,
+            "anchors": [a.key() for a in anchors],
+            "page_width": page_width,
+            "page_height": page_height,
+        }
+        block = Block(
+            block_type=BlockType.PARAGRAPH,
+            path=f"/ocr_page_{page_number}/line_{idx}",
+            page_number=page_number,
+            bbox=[24.0, y0, page_width - 24.0, y1],
+            text=line,
+            payload=payload,
+            sequence=seq,
+        )
+        block.content_hash = _hash_content(payload)
+        blocks.append(block)
+        seq += 1
+
+    return blocks, seq
+
+
 def _table_sort_key(st) -> tuple[int, float]:
     first_page = st.pages[0]
     bbox = st.bboxes_by_page.get(first_page)
@@ -518,29 +579,19 @@ def extract_blocks_v2(
             doc.close()
 
             blocks: list[Block] = []
+            seq = 0
 
             for p in range(1, n_pages + 1):
-                txt = ocr_full_page(pdf_path, p)
-                if txt.strip():
-                    page_width, page_height = page_sizes.get(p, (612, 792))
-                    anchors = find_anchors(txt)
-                    payload = {
-                        "text": txt,
-                        "ocr": True,
-                        "anchors": [a.key() for a in anchors],
-                        "page_width": page_width,
-                        "page_height": page_height,
-                    }
-                    b = Block(
-                        block_type=BlockType.PARAGRAPH,
-                        path=f"/scanned_page_{p}",
-                        page_number=p,
-                        text=txt,
-                        payload=payload,
-                        sequence=p,
-                    )
-                    b.content_hash = _hash_content(payload)
-                    blocks.append(b)
+                page_width, page_height = page_sizes.get(p, (612, 792))
+                page_blocks, seq = _ocr_line_blocks(
+                    pdf_path=pdf_path,
+                    page_number=p,
+                    page_width=page_width,
+                    page_height=page_height,
+                    start_sequence=seq,
+                    defined_terms=None,
+                )
+                blocks.extend(page_blocks)
 
             return blocks
 
@@ -850,6 +901,31 @@ def extract_blocks_v2(
             blk.content_hash = _hash_content(payload)
             blocks.append(blk)
             seq += 1
+
+        # Some PDFs contain a light text layer plus important scanned/image
+        # content. In those cases the main line extraction is not empty, so the
+        # early scanned-PDF path above will not run. Add page-level OCR line
+        # blocks only for pages with very little normal text so we do not flood
+        # clean digital PDFs with duplicate content.
+        line_chars_by_page: dict[int, int] = {}
+        for ln in lines:
+            line_chars_by_page[ln.page] = line_chars_by_page.get(ln.page, 0) + len(ln.text.strip())
+
+        for page_number, (page_width, page_height) in page_sizes.items():
+            if line_chars_by_page.get(page_number, 0) >= 80:
+                continue
+            if not is_scanned_page(pdf_path, page_number, min_text_chars=80):
+                continue
+
+            page_blocks, seq = _ocr_line_blocks(
+                pdf_path=pdf_path,
+                page_number=page_number,
+                page_width=page_width,
+                page_height=page_height,
+                start_sequence=seq,
+                defined_terms=defined_terms,
+            )
+            blocks.extend(page_blocks)
 
     return blocks
 
