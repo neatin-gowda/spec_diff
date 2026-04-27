@@ -57,6 +57,7 @@ class CompareResponse(BaseModel):
 
 class QueryReq(BaseModel):
     question: str
+    mode: str = "fast"
 
 
 class CompareTablesReq(BaseModel):
@@ -511,6 +512,7 @@ def post_query(run_id: str, req: QueryReq):
         r["base_blocks"],
         r["target_blocks"],
         db_run_id=r.get("db_run_id"),
+        mode=req.mode,
     )
 
     if isinstance(result, dict):
