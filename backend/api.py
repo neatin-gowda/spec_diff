@@ -31,7 +31,7 @@ from rapidfuzz import fuzz
 from .differ_v2 import diff_blocks, diff_stats
 from .extractor_v2 import coverage_pct, extract_blocks_v2 as extract_blocks, render_pages
 from .models import Block, ChangeType
-from .query import query as nl_query
+from .query import ai_health, query as nl_query
 from .summarizer import summarize
 
 
@@ -303,6 +303,7 @@ def root():
         "endpoints": [
             "POST /compare",
             "GET /db-health",
+            "GET /ai-health",
             "GET /runs/{id}",
             "GET /runs/{id}/diff",
             "GET /runs/{id}/summary",
@@ -326,6 +327,11 @@ def health():
 @app.get("/db-health")
 def db_health():
     return _db_health_payload()
+
+
+@app.get("/ai-health")
+def get_ai_health():
+    return ai_health()
 
 
 @app.post("/compare", response_model=CompareResponse)
