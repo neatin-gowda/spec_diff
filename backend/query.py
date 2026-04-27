@@ -93,7 +93,7 @@ CATEGORY_KEYWORDS = {
     "requirement": ("required", "requires", "must", "shall", "mandatory"),
     "legal": ("section", "clause", "article", "agreement", "warranty", "liability"),
     "product": ("engine", "package", "feature", "model", "series", "equipment", "paint", "color"),
-    "table": ("table", "row", "column", "cell", "code", "pcb", "part", "item", "value"),
+    "table": ("table", "row", "column", "cell", "code", "pcb", "pcv", "part", "item", "value"),
 }
 
 STOP_QUERY_TERMS = {
@@ -101,6 +101,21 @@ STOP_QUERY_TERMS = {
     "compare", "between", "from", "with", "against", "previous", "current",
     "target", "base", "baseline", "latest", "revised", "file", "document",
     "table", "row", "column", "value", "old", "new", "the", "and", "for",
+}
+
+
+IDENTIFIER_CONTEXT_TERMS = {
+    "pcv",
+    "pcb",
+    "code",
+    "part",
+    "item",
+    "row",
+    "column",
+    "value",
+    "values",
+    "package",
+    "feature",
 }
 
 
@@ -260,7 +275,7 @@ def _confidence(d: BlockDiff, block: Block) -> float:
 def _is_table_intent(nl: str) -> bool:
     q = _norm(nl)
     table_terms = (
-        "table", "row", "column", "cell", "code", "pcb", "part number",
+        "table", "row", "column", "cell", "code", "pcb", "pcv", "part number",
         "item number", "compare", "value", "values"
     )
     has_table_word = any(term in q for term in table_terms)
@@ -1020,6 +1035,95 @@ def _merge_rows(primary: list[dict], semantic: list[dict], limit: int = 200) -> 
     return merged[:limit]
 
 
+def _merge_many_rows(*row_sets: list[dict], limit: int = 400) -> list[dict]:
+    seen = set()
+    merged = []
+
+    for rows in row_sets:
+        for row in rows or []:
+            key = (
+                row.get("type"),
+                row.get("change_type"),
+                row.get("citation"),
+                row.get("row_key"),
+                row.get("stable_key"),
+                row.get("before"),
+                row.get("after"),
+                row.get("text"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+            if len(merged) >= limit:
+                return merged
+
+    return merged
+
+
+def _identifier_terms(nl: str) -> list[str]:
+    terms = []
+    terms.extend(_extract_identifiers(nl))
+
+    for token in re.findall(r"[\w\-]{3,80}", str(nl or ""), flags=re.UNICODE):
+        low = _norm(token)
+        if low and low not in STOP_QUERY_TERMS and (low in IDENTIFIER_CONTEXT_TERMS or re.search(r"\d", low)):
+            terms.append(token)
+
+    out = []
+    for term in terms:
+        clean = str(term or "").strip()
+        if clean and clean.lower() not in {x.lower() for x in out}:
+            out.append(clean)
+    return out
+
+
+def _row_contains_any(row: dict, terms: list[str]) -> bool:
+    if not terms:
+        return False
+
+    text_parts = [
+        row.get("stable_key"),
+        row.get("row_key"),
+        row.get("area"),
+        row.get("path"),
+        row.get("before"),
+        row.get("after"),
+        row.get("text"),
+        row.get("definition"),
+        row.get("values"),
+        row.get("field_changes"),
+    ]
+    haystack = _norm(json.dumps(text_parts, ensure_ascii=False, default=str))
+    return any(_norm(term) and _norm(term) in haystack for term in terms)
+
+
+def _focused_identifier_rows(rows: list[dict], nl: str, limit: int = 90) -> list[dict]:
+    terms = _identifier_terms(nl)
+    if not terms:
+        return []
+
+    exact = [row for row in rows if _row_contains_any(row, terms)]
+    exact.sort(
+        key=lambda r: (
+            0 if str(r.get("block_type") or "").lower() == "table_row" else 1,
+            -float(r.get("impact") or 0),
+            -float(r.get("confidence") or 0),
+        )
+    )
+    return exact[:limit]
+
+
+def _ai_evidence_limit(nl: str, rows: list[dict]) -> int:
+    if _is_table_intent(nl) or _identifier_terms(nl):
+        return 180
+    if _is_summary_intent(nl) or _is_feature_review_table_intent(nl):
+        return 220 if len(rows) > 120 else 140
+    if _wants_table_output(nl):
+        return 160
+    return 90
+
+
 def _count_changes(rows: list[dict]) -> dict[str, int]:
     counts = {"ADDED": 0, "DELETED": 0, "MODIFIED": 0, "UNCHANGED": 0, "MATCH": 0}
     for row in rows:
@@ -1231,9 +1335,11 @@ def _wants_table_output(nl: str) -> bool:
     )
 
 
-def _curated_ai_evidence(rows: list[dict], semantic_rows: list[dict], limit: int = 60) -> list[dict]:
+def _curated_ai_evidence(nl: str, rows: list[dict], semantic_rows: list[dict], limit: Optional[int] = None) -> list[dict]:
+    limit = limit or _ai_evidence_limit(nl, rows)
+    focused = _focused_identifier_rows(rows, nl, limit=max(40, min(100, limit // 2)))
     selected = _priority_rows(rows, limit=limit)
-    merged = _merge_rows(selected, semantic_rows, limit=limit)
+    merged = _merge_many_rows(focused, selected, semantic_rows, limit=limit)
 
     evidence = []
     for row in merged:
@@ -1248,6 +1354,9 @@ def _curated_ai_evidence(rows: list[dict], semantic_rows: list[dict], limit: int
                 "field_changes": row.get("field_changes") or [],
                 "definition": row.get("definition"),
                 "values": row.get("values"),
+                "row_key": row.get("row_key"),
+                "table_header": row.get("table_header"),
+                "column_alignment": row.get("column_alignment"),
                 "citation": row.get("citation"),
                 "page_base": row.get("page_base"),
                 "page_target": row.get("page_target"),
@@ -1270,6 +1379,8 @@ Hard rules:
 - Prefer concise business language with specific before/after changes.
 - Work across languages. If the source evidence or user question is Arabic or another language, preserve the meaning and answer in the user's language when clear; otherwise use clear English.
 - For right-to-left text, preserve the original terms, numbers, units, dates, and names exactly as evidence shows them.
+- Response language preference: {response_language}. If this is "source", keep the answer in the dominant language of the source evidence/question. If it is a specific language, answer in that language while preserving source names, numbers, codes, legal terms, and table values exactly.
+- If the evidence contains multiple languages, do not discard either language. Keep original terms where they matter and explain the mismatch semantically.
 
 Answer style:
 - For the standard key-changes request, return a compact table only.
@@ -1283,6 +1394,8 @@ Answer style:
 - "Seek Clarification" means the practical question a business user should ask the relevant team, supplier, legal, finance, engineering, or document owner before accepting the change. It is not a statement about AI uncertainty.
 - Prioritize high-impact mismatches: changed numeric values, dates, obligations, availability/status, pricing/cost, requirements, exclusions, names, codes, table cell changes, added/deleted sections, and wording that changes meaning.
 - When many changes exist, group or merge similar evidence into concise user-useful rows.
+- If the question names a specific PCV, PCB, code, part number, row, column, or numeric identifier, make that identifier the center of the answer and include all available row/cell changes for it from the evidence.
+- If the evidence contains table row values or column alignment, compare those cells directly instead of giving a generic document summary.
 
 Question:
 {question}
@@ -1302,7 +1415,12 @@ Return strict JSON only with this schema:
 """
 
 
-def llm_freeform_answer(nl: str, rows: list[dict], semantic_rows: list[dict]) -> tuple[Optional[dict], Optional[str]]:
+def llm_freeform_answer(
+    nl: str,
+    rows: list[dict],
+    semantic_rows: list[dict],
+    response_language: str = "source",
+) -> tuple[Optional[dict], Optional[str]]:
     config = _openai_config()
     endpoint = _env_first(AI_ENV_NAMES["endpoint"])
     api_key = _env_first(AI_ENV_NAMES["api_key"])
@@ -1311,7 +1429,7 @@ def llm_freeform_answer(nl: str, rows: list[dict], semantic_rows: list[dict]) ->
     if not config["configured"]:
         return None, "Azure OpenAI chat is not configured: missing " + ", ".join(config["missing"])
 
-    evidence_rows = _curated_ai_evidence(rows, semantic_rows, limit=70)
+    evidence_rows = _curated_ai_evidence(nl, rows, semantic_rows)
     if not evidence_rows:
         return None, "No extracted/vector evidence was available to send to Azure OpenAI."
 
@@ -1328,9 +1446,17 @@ def llm_freeform_answer(nl: str, rows: list[dict], semantic_rows: list[dict]) ->
             model=deploy,
             messages=[
                 {"role": "system", "content": "Return strict JSON only. Do not include markdown fences."},
-                {"role": "user", "content": AI_REVIEW_PROMPT.format(question=nl, evidence=evidence)},
+                {
+                    "role": "user",
+                    "content": AI_REVIEW_PROMPT.format(
+                        question=nl,
+                        evidence=evidence,
+                        response_language=response_language or "source",
+                    ),
+                },
             ],
             temperature=0.15,
+            max_tokens=3500,
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content or "{}")
@@ -1460,6 +1586,7 @@ def query(
     target_blocks: list[Block],
     db_run_id: Optional[str] = None,
     mode: str = "fast",
+    response_language: str = "source",
 ) -> dict:
     table_result = _table_query_answer(nl, base_blocks, target_blocks)
     normalized_mode = _norm(mode) or "fast"
@@ -1484,16 +1611,21 @@ def query(
         plan = _broad_summary_plan(nl)
         rows = execute_plan(plan, diffs, base_blocks, target_blocks)
 
-    rows = _merge_rows(rows, semantic_rows)
+    table_rows = []
+    if table_result is not None:
+        table_rows = table_result.get("rows") or []
+
+    rows = _merge_many_rows(table_rows, _focused_identifier_rows(rows, nl), rows, semantic_rows, limit=450)
 
     if use_ai:
-        ai_result, ai_error = llm_freeform_answer(nl, rows, semantic_rows)
+        ai_result, ai_error = llm_freeform_answer(nl, rows, semantic_rows, response_language=response_language)
         if ai_result:
             ai_result.update(
                 {
                     "mode": "ai",
                     "ai_called": True,
                     "ai_error": None,
+                    "response_language": response_language,
                     "plan": plan,
                     "semantic_matches": len(semantic_rows),
                     "source_rows": len(rows),
@@ -1513,6 +1645,7 @@ def query(
         fallback["ai_unavailable"] = True
         fallback["ai_error"] = ai_error or "Azure OpenAI did not return a usable response."
         fallback["answer"] = "AI Summarization is unavailable right now. I could not generate a model-assisted answer from the extracted evidence."
+        fallback["response_language"] = response_language
         return fallback
 
     if is_summary:
