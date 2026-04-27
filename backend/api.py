@@ -67,6 +67,7 @@ class CompareResponse(BaseModel):
 class QueryReq(BaseModel):
     question: str
     mode: str = "fast"
+    response_language: str = "source"
 
 
 class AiSummaryPdfReq(BaseModel):
@@ -745,6 +746,7 @@ def post_query(run_id: str, req: QueryReq):
         r["target_blocks"],
         db_run_id=r.get("db_run_id"),
         mode=req.mode,
+        response_language=req.response_language,
     )
 
     if isinstance(result, dict):
