@@ -835,6 +835,7 @@ function ReviewReport({ runId }) {
 
 function QueryPanel({ runId }) {
   const [q, setQ] = useState("");
+  const [mode, setMode] = useState("fast");
   const [response, setResponse] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -847,7 +848,7 @@ function QueryPanel({ runId }) {
       const r = await fetch(`${API}/runs/${runId}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q }),
+        body: JSON.stringify({ question: q, mode }),
       });
 
       if (!r.ok) throw new Error(await readResponseError(r));
@@ -869,24 +870,54 @@ function QueryPanel({ runId }) {
       <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 12 }}>
         <div style={{ fontWeight: 650, marginBottom: 6 }}>Ask about the comparison</div>
         <div style={{ color: "#667085", fontSize: 13, marginBottom: 10 }}>
-          Ask for a summary, evidence, a table row, a code, a PCV value, or a specific column comparison.
+          Use fast query for exact evidence lookup, or OpenAI review for a freer summary/table answer from extracted and vector-ranked context.
         </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          <button
+            type="button"
+            onClick={() => setMode("fast")}
+            disabled={busy}
+            style={modeButtonStyle(mode === "fast", busy)}
+          >
+            Natural language query
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("ai")}
+            disabled={busy}
+            style={modeButtonStyle(mode === "ai", busy)}
+          >
+            OpenAI review
+          </button>
+        </div>
+
         <div style={{ display: "flex", gap: 8 }}>
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && ask()}
-            placeholder="Example: Summarize changes in equipment group availability as a table"
+            placeholder={
+              mode === "ai"
+                ? "Example: Create a Feature, Change, Seek Clarification table with citations"
+                : "Example: Find changes for PCV 205 or summarize key changes"
+            }
             style={{ ...inputStyle, flex: 1 }}
           />
           <button onClick={ask} disabled={busy} style={primaryButtonStyle(busy)}>
-            {busy ? "Searching" : "Ask"}
+            {busy ? (mode === "ai" ? "Reviewing" : "Searching") : "Ask"}
           </button>
         </div>
       </div>
 
       {response?.answer && (
         <div style={{ background: "#fffdf8", border: "1px solid #d8d0c3", borderLeft: "4px solid #2f5f4f", borderRadius: 8, padding: 12, marginBottom: 12, color: "#344054", lineHeight: 1.45 }}>
+          {response.mode && (
+            <div style={{ color: "#667085", fontSize: 12, fontWeight: 650, marginBottom: 6 }}>
+              {response.mode === "ai" ? "OpenAI review" : "Natural language query"}
+              {response.ai_unavailable ? " - fallback used" : ""}
+            </div>
+          )}
           {response.answer}
         </div>
       )}
@@ -1754,6 +1785,19 @@ function filterButtonStyle(active) {
     padding: "7px 11px",
     cursor: "pointer",
     fontWeight: 600,
+  };
+}
+
+function modeButtonStyle(active, disabled = false) {
+  return {
+    border: `1px solid ${active ? "#1f2937" : "#c9c0b0"}`,
+    background: active ? "#1f2937" : "#fffdf8",
+    color: active ? "white" : "#344054",
+    borderRadius: 999,
+    padding: "7px 12px",
+    cursor: disabled ? "default" : "pointer",
+    fontWeight: 600,
+    opacity: disabled ? 0.7 : 1,
   };
 }
 
