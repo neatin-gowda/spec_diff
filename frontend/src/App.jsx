@@ -944,6 +944,7 @@ const FAST_QUERY_PRESETS = [
 function QueryPanel({ runId }) {
   const [q, setQ] = useState(DEFAULT_AI_SUMMARY_PROMPT);
   const [mode, setMode] = useState("ai");
+  const [responseLanguage, setResponseLanguage] = useState("source");
   const [response, setResponse] = useState(null);
   const [busy, setBusy] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState(false);
@@ -959,7 +960,7 @@ function QueryPanel({ runId }) {
       const r = await fetch(`${API}/runs/${runId}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: effectiveQuestion, mode }),
+        body: JSON.stringify({ question: effectiveQuestion, mode, response_language: responseLanguage }),
       });
 
       if (!r.ok) throw new Error(await readResponseError(r));
@@ -1053,6 +1054,27 @@ function QueryPanel({ runId }) {
           >
             AI Summarization
           </button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+          <label style={{ color: "#667085", fontSize: 13, fontWeight: 600 }}>Response language</label>
+          <select
+            value={responseLanguage}
+            onChange={(e) => {
+              setResponseLanguage(e.target.value);
+              setResponse(null);
+            }}
+            disabled={busy}
+            style={{ ...inputStyle, width: 230, padding: "7px 9px" }}
+          >
+            <option value="source">Keep source language</option>
+            <option value="english">English</option>
+            <option value="arabic">Arabic</option>
+            <option value="bilingual">Bilingual source + English</option>
+          </select>
+          <span style={{ color: "#667085", fontSize: 12 }}>
+            Source text, table values, codes, and names are preserved as extracted.
+          </span>
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
