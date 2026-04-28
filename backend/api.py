@@ -430,6 +430,225 @@ def _semantic_field_candidates(blocks: list[Block], limit: int = 220) -> list[di
     return fields
 
 
+def _extract_text_fields(text: Any, page: int, path: str, source: str) -> list[dict[str, Any]]:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw:
+        return []
+
+    fields = []
+    seen = set()
+    key_value_pairs = re.findall(
+        r"([^\s:：|,;][^:：|,;]{1,70})\s*[:：]\s*([^|,;]{1,260})",
+        raw,
+        flags=re.UNICODE,
+    )
+    for key, value in key_value_pairs:
+        clean_key = re.sub(r"\s+", " ", key).strip()
+        clean_value = re.sub(r"\s+", " ", value).strip()
+        if not clean_key or not clean_value:
+            continue
+        dedupe = (clean_key.lower(), clean_value.lower())
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        fields.append(
+            {
+                "field": clean_key,
+                "value": clean_value,
+                "page": page,
+                "source": source,
+                "citation": f"p.{page} - {_path_label(path)}",
+            }
+        )
+
+    attribute_patterns = [
+        ("color", re.compile(r"\b(?:colou?r|shade)\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z\s/-]{2,40})", re.I)),
+        ("size", re.compile(r"\b(?:size|dimension)\s*(?:is|=|:)?\s*([A-Z0-9][A-Z0-9\s./x-]{0,40})", re.I)),
+        ("quantity", re.compile(r"\b(?:qty|quantity|count|units?)\s*(?:is|=|:)?\s*(\d[\d,]*(?:\.\d+)?)", re.I)),
+        ("price", re.compile(r"([$€£]\s?\d[\d,]*(?:\.\d+)?)")),
+        ("percentage", re.compile(r"\b(\d+(?:\.\d+)?%)\b")),
+        ("date", re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b")),
+        ("code", re.compile(r"\b([A-Z]{1,8}[- ]?\d{2,12}[A-Z]?)\b", re.I)),
+    ]
+
+    for field_name, pattern in attribute_patterns:
+        for attr_match in pattern.finditer(raw):
+            value = re.sub(r"\s+", " ", attr_match.group(1)).strip()
+            if not value:
+                continue
+            dedupe = (field_name, value.lower())
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            fields.append(
+                {
+                    "field": field_name,
+                    "value": value,
+                    "page": page,
+                    "source": source,
+                    "citation": f"p.{page} - {_path_label(path)}",
+                }
+            )
+
+    return fields
+
+
+def _inline_record_from_text(text: Any) -> Optional[dict[str, Any]]:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw:
+        return None
+
+    if "|" in raw:
+        cells = [part.strip() for part in raw.split("|") if part.strip()]
+    elif "\t" in raw:
+        cells = [part.strip() for part in raw.split("\t") if part.strip()]
+    else:
+        cells = [part.strip() for part in re.split(r"\s{3,}", str(text or "")) if part.strip()]
+
+    if len(cells) >= 2:
+        return {
+            "record_type": "inline_row",
+            "columns": [f"Column {idx + 1}" for idx in range(len(cells))],
+            "values": {f"Column {idx + 1}": value for idx, value in enumerate(cells)},
+            "text": raw,
+        }
+
+    fields = _extract_text_fields(raw, 0, "", "inline_text")
+    if len(fields) >= 2:
+        return {
+            "record_type": "inline_key_values",
+            "values": {field["field"]: field["value"] for field in fields},
+            "text": raw,
+        }
+
+    return None
+
+
+def _business_structure(blocks: list[Block], tables: list[dict[str, Any]]) -> dict[str, Any]:
+    table_by_path = {table.get("path"): table for table in tables}
+    table_paths = set(table_by_path.keys())
+    documents: dict[int, dict[str, Any]] = {}
+    section_by_doc: dict[int, dict[str, Any]] = {}
+
+    def _doc_for(block: Block) -> dict[str, Any]:
+        payload = block.payload if isinstance(block.payload, dict) else {}
+        doc_index = int(payload.get("document_index") or 1)
+        doc_label = payload.get("document_label") or "document"
+        if doc_index not in documents:
+            documents[doc_index] = {
+                "document_index": doc_index,
+                "label": doc_label,
+                "sections": [],
+            }
+        return documents[doc_index]
+
+    def _ensure_page_section(block: Block) -> dict[str, Any]:
+        doc = _doc_for(block)
+        doc_index = int(doc["document_index"])
+        current = section_by_doc.get(doc_index)
+        if current and current.get("page") == block.page_number:
+            return current
+
+        section = {
+            "title": f"Page {block.page_number}",
+            "page": block.page_number,
+            "path": f"/page_{block.page_number}",
+            "content": [],
+            "fields": [],
+            "inline_records": [],
+            "tables": [],
+        }
+        doc["sections"].append(section)
+        section_by_doc[doc_index] = section
+        return section
+
+    for block in sorted(blocks, key=lambda b: (b.page_number, b.sequence)):
+        payload = block.payload if isinstance(block.payload, dict) else {}
+        doc = _doc_for(block)
+        doc_index = int(doc["document_index"])
+
+        if block.block_type.value in {"section", "heading"}:
+            section = {
+                "title": block.text or _path_label(block.path),
+                "page": block.page_number,
+                "path": block.path,
+                "content": [],
+                "fields": [],
+                "inline_records": [],
+                "tables": [],
+            }
+            doc["sections"].append(section)
+            section_by_doc[doc_index] = section
+            continue
+
+        section = section_by_doc.get(doc_index) or _ensure_page_section(block)
+
+        if block.block_type.value == "table":
+            table = table_by_path.get(block.path)
+            if table:
+                section["tables"].append(
+                    {
+                        "title": table.get("display_name") or table.get("title") or "Detected table",
+                        "page_label": table.get("page_label"),
+                        "columns": table.get("columns", []),
+                        "row_count": table.get("n_rows", 0),
+                        "sample_rows": (table.get("rows") or table.get("row_preview") or [])[:8],
+                    }
+                )
+            continue
+
+        if block.block_type.value == "table_row" or block.path in table_paths:
+            continue
+
+        text = block.text or payload.get("text") or payload.get("layout_text") or ""
+        if not str(text).strip():
+            continue
+
+        fields = _extract_text_fields(text, block.page_number, block.path, block.block_type.value)
+        inline_record = _inline_record_from_text(text)
+
+        content_item = {
+            "type": block.block_type.value,
+            "page": block.page_number,
+            "path": block.path,
+            "text": text,
+        }
+        if fields:
+            content_item["fields"] = fields
+            section["fields"].extend(fields)
+        if inline_record:
+            inline_record["page"] = block.page_number
+            inline_record["citation"] = f"p.{block.page_number} - {_path_label(block.path)}"
+            section["inline_records"].append(inline_record)
+
+        section["content"].append(content_item)
+
+    for doc in documents.values():
+        if not doc["sections"]:
+            doc["sections"].append(
+                {
+                    "title": "Document",
+                    "page": 1,
+                    "path": "/document",
+                    "content": [],
+                    "fields": [],
+                    "inline_records": [],
+                    "tables": [],
+                }
+            )
+
+        for section in doc["sections"]:
+            section["content"] = section["content"][:80]
+            section["fields"] = section["fields"][:80]
+            section["inline_records"] = section["inline_records"][:40]
+            section["tables"] = section["tables"][:20]
+
+    return {
+        "documents": [documents[key] for key in sorted(documents)],
+        "section_count": sum(len(doc["sections"]) for doc in documents.values()),
+    }
+
+
 def _structured_extraction_json(r: dict, run_id: str) -> dict[str, Any]:
     blocks = r.get("blocks", [])
     tables = [
@@ -471,6 +690,7 @@ def _structured_extraction_json(r: dict, run_id: str) -> dict[str, Any]:
         "summary": r.get("summary", {}),
         "coverage": r.get("coverage"),
         "semantic_fields": _semantic_field_candidates(blocks),
+        "business_structure": _business_structure(blocks, tables),
         "sections": sections,
         "tables": tables,
         "text_blocks": text_blocks,
