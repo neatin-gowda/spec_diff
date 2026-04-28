@@ -123,6 +123,10 @@ class CompareTableColumnsReq(BaseModel):
     # Maximum output rows.
     limit: int = 200
 
+    # Optional focused AI review over only this selected table slice.
+    use_ai: bool = False
+    question: Optional[str] = None
+
 
 def _dump_model(obj):
     if hasattr(obj, "model_dump"):
@@ -301,6 +305,151 @@ def _extraction_summary(blocks: list[Block], coverage: float, page_count: int, s
     }
 
 
+def _adjust_extraction_blocks(
+    blocks: list[Block],
+    *,
+    doc_index: int,
+    label: str,
+    page_offset: int,
+) -> list[Block]:
+    """
+    Multiple uploaded files are exposed as one extraction workspace. Prefix
+    paths and offset pages so page lookup, citations, and JSON remain stable.
+    """
+    label_slug = re.sub(r"[^A-Za-z0-9]+", "_", str(label or f"document_{doc_index}")).strip("_").lower() or f"document_{doc_index}"
+
+    for block in blocks:
+        block.page_number = int(block.page_number or 1) + page_offset
+        original_path = block.path or f"/block_{block.sequence}"
+        if not original_path.startswith(f"/{label_slug}/"):
+            block.path = f"/{label_slug}{original_path if original_path.startswith('/') else '/' + original_path}"
+
+        payload = block.payload if isinstance(block.payload, dict) else {}
+        payload["document_index"] = doc_index
+        payload["document_label"] = label
+        payload["original_page_number"] = int(block.page_number or 1) - page_offset
+
+        for pages_key in ("spans_pages", "__pages__"):
+            if isinstance(payload.get(pages_key), list):
+                payload[pages_key] = [
+                    int(page or 1) + page_offset
+                    for page in payload.get(pages_key, [])
+                    if str(page or "").strip()
+                ]
+
+        if isinstance(payload.get("bbox_by_page"), dict):
+            payload["bbox_by_page"] = {
+                str(int(page) + page_offset): bbox
+                for page, bbox in payload.get("bbox_by_page", {}).items()
+                if str(page).isdigit()
+            }
+
+        block.payload = payload
+
+    return blocks
+
+
+def _semantic_field_candidates(blocks: list[Block], limit: int = 220) -> list[dict[str, Any]]:
+    fields = []
+    seen = set()
+    key_value_rx = re.compile(r"^\s*([^:：]{2,80})\s*[:：]\s*(.{1,300})$")
+
+    for block in blocks:
+        payload = block.payload if isinstance(block.payload, dict) else {}
+        text = block.text or payload.get("text") or ""
+        match = key_value_rx.match(str(text))
+        if match:
+            key = re.sub(r"\s+", " ", match.group(1)).strip()
+            value = re.sub(r"\s+", " ", match.group(2)).strip()
+            dedupe = (block.page_number, key.lower(), value.lower())
+            if dedupe not in seen:
+                seen.add(dedupe)
+                fields.append(
+                    {
+                        "field": key,
+                        "value": value,
+                        "page": block.page_number,
+                        "source": block.block_type.value,
+                        "citation": f"p.{block.page_number} - {_path_label(block.path)}",
+                    }
+                )
+
+        if block.block_type.value == "table_row":
+            for key, value in payload.items():
+                if str(key).startswith("__") or str(key) in {"source_format", "page_width", "page_height", "anchors"}:
+                    continue
+                clean_value = str(value or "").strip()
+                if not clean_value:
+                    continue
+                dedupe = (block.page_number, str(key).lower(), clean_value.lower())
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                fields.append(
+                    {
+                        "field": str(key),
+                        "value": clean_value,
+                        "page": block.page_number,
+                        "source": "table_row",
+                        "table": payload.get("__table_title__"),
+                        "citation": f"p.{block.page_number} - {_path_label(block.path)}",
+                    }
+                )
+
+        if len(fields) >= limit:
+            break
+
+    return fields
+
+
+def _structured_extraction_json(r: dict, run_id: str) -> dict[str, Any]:
+    blocks = r.get("blocks", [])
+    tables = [
+        _table_matrix(block, blocks, include_rows=True)
+        for block in blocks
+        if block.block_type.value == "table"
+    ]
+    sections = [
+        {
+            "title": block.text or _path_label(block.path),
+            "page": block.page_number,
+            "path": block.path,
+            "text": block.text,
+        }
+        for block in blocks
+        if block.block_type.value in {"section", "heading"}
+    ][:200]
+    text_blocks = [
+        {
+            "page": block.page_number,
+            "type": block.block_type.value,
+            "path": block.path,
+            "text": block.text,
+        }
+        for block in blocks
+        if block.block_type.value in {"paragraph", "list_item", "kv_pair", "figure"}
+    ][:500]
+
+    return {
+        "run_id": run_id,
+        "documents": r.get("documents") or [
+            {
+                "label": r.get("label"),
+                "source_format": r.get("source_format"),
+                "page_start": 1,
+                "page_count": len(r.get("page_imgs", [])),
+            }
+        ],
+        "summary": r.get("summary", {}),
+        "coverage": r.get("coverage"),
+        "semantic_fields": _semantic_field_candidates(blocks),
+        "sections": sections,
+        "tables": tables,
+        "text_blocks": text_blocks,
+        "ai_analysis": r.get("ai_analysis"),
+    }
+
+
 def _curated_extraction_context(blocks: list[Block], limit_chars: int = 42000) -> str:
     parts = []
     used = 0
@@ -391,7 +540,7 @@ def _ai_extraction_summary(blocks: list[Block], summary: dict[str, Any]) -> Opti
 def _process_extract(
     run_id: str,
     work: Path,
-    source: Path,
+    sources: list[Path],
     label: str,
     use_ai: bool,
 ) -> None:
@@ -399,27 +548,63 @@ def _process_extract(
         _set_run_status(run_id, "Preparing uploaded document", 12)
 
         converted_dir = work / "converted"
-        pdf_path = normalize_to_pdf(source, converted_dir / "extract")
-        fmt = source_kind(source)
+        all_blocks: list[Block] = []
+        all_page_imgs: list[Path] = []
+        pdf_paths: list[Path] = []
+        coverages: list[float] = []
+        documents_meta: list[dict[str, Any]] = []
+        page_offset = 0
 
-        _RUNS[run_id].update(
-            {
-                "source": source,
-                "pdf": pdf_path,
-                "source_format": fmt,
-            }
-        )
+        total_sources = max(1, len(sources))
+        for idx, source in enumerate(sources, start=1):
+            source_label = Path(source).stem.replace("extract_", "", 1)
+            fmt = source_kind(source)
+            progress_base = 12 + int((idx - 1) * 52 / total_sources)
 
-        _set_run_status(run_id, "Rendering preview pages", 24)
-        page_imgs = render_pages(str(pdf_path), str(work / "pages_extract"))
-        _RUNS[run_id]["page_imgs"] = page_imgs
+            _set_run_status(run_id, f"Converting {source_label}", progress_base)
+            pdf_path = normalize_to_pdf(source, converted_dir / f"extract_{idx}")
+            pdf_paths.append(pdf_path)
 
-        _set_run_status(run_id, "Extracting text, tables, and image content", 48)
-        blocks = extract_blocks_from_source(source, pdf_path, extract_blocks)
+            _set_run_status(run_id, f"Rendering preview pages for {source_label}", min(62, progress_base + 10))
+            page_imgs = render_pages(str(pdf_path), str(work / f"pages_extract_{idx}"))
+            all_page_imgs.extend(page_imgs)
+            _RUNS[run_id]["page_imgs"] = all_page_imgs
 
-        _set_run_status(run_id, "Checking extraction coverage", 64)
-        coverage = coverage_for_source(source, pdf_path, blocks, coverage_pct)
+            _set_run_status(run_id, f"Extracting text, tables, and image content from {source_label}", min(70, progress_base + 24))
+            blocks = extract_blocks_from_source(source, pdf_path, extract_blocks)
+            blocks = _adjust_extraction_blocks(
+                blocks,
+                doc_index=idx,
+                label=source_label,
+                page_offset=page_offset,
+            )
+            all_blocks.extend(blocks)
+
+            _set_run_status(run_id, f"Checking extraction coverage for {source_label}", min(76, progress_base + 38))
+            coverage = coverage_for_source(source, pdf_path, blocks, coverage_pct)
+            coverages.append(coverage)
+            documents_meta.append(
+                {
+                    "index": idx,
+                    "label": source_label,
+                    "filename": source.name,
+                    "source_format": fmt,
+                    "pdf_path": str(pdf_path),
+                    "page_start": page_offset + 1,
+                    "page_count": len(page_imgs),
+                    "native_pages": _max_block_page(blocks),
+                    "coverage": coverage,
+                }
+            )
+            page_offset += len(page_imgs)
+
+        blocks = all_blocks
+        page_imgs = all_page_imgs
+        fmt = source_kind(sources[0]) if len(sources) == 1 else "mixed"
+        coverage = round(sum(coverages) / len(coverages), 2) if coverages else 0.0
         summary = _extraction_summary(blocks, coverage, len(page_imgs), fmt)
+        summary["document_count"] = len(sources)
+        summary["documents"] = documents_meta
 
         ai_analysis = None
         if use_ai:
@@ -436,9 +621,12 @@ def _process_extract(
                 "kind": "extraction",
                 "work": work,
                 "label": label,
-                "source": source,
-                "pdf": pdf_path,
+                "source": sources[0] if sources else None,
+                "sources": sources,
+                "pdf": pdf_paths[0] if pdf_paths else None,
+                "pdfs": pdf_paths,
                 "source_format": fmt,
+                "documents": documents_meta,
                 "page_imgs": page_imgs,
                 "native_pages": _max_block_page(blocks),
                 "blocks": blocks,
@@ -593,6 +781,7 @@ def root():
             "GET /extract-runs/{id}/blocks",
             "GET /extract-runs/{id}/tables",
             "GET /extract-runs/{id}/images",
+            "GET /extract-runs/{id}/structured-json",
             "GET /extract-runs/{id}/json",
             "POST /compare",
             "GET /db-health",
@@ -708,15 +897,16 @@ async def compare(
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_document(
-    document: UploadFile = File(..., description="Document or image to extract"),
+    document: list[UploadFile] = File(..., description="One or more documents/images to extract"),
     use_ai: bool = Form(False),
 ):
-    if not document.filename:
-        raise HTTPException(400, "Document file is required")
+    uploads = [item for item in document if item and item.filename]
+    if not uploads:
+        raise HTTPException(400, "At least one document file is required")
 
     run_id = str(uuid.uuid4())
     work = Path(tempfile.mkdtemp(prefix=f"doc_extract_{run_id}_"))
-    label = Path(document.filename).stem
+    label = Path(uploads[0].filename or "document").stem if len(uploads) == 1 else f"{len(uploads)} documents"
 
     _RUNS[run_id] = {
         "kind": "extraction",
@@ -732,11 +922,24 @@ async def extract_document(
     }
 
     try:
-        source = save_upload_to_source(document, work, "extract")
+        sources = [
+            save_upload_to_source(upload, work, f"extract_{idx + 1}")
+            for idx, upload in enumerate(uploads)
+        ]
         _RUNS[run_id].update(
             {
-                "source": source,
-                "source_format": source_kind(source),
+                "source": sources[0],
+                "sources": sources,
+                "source_format": source_kind(sources[0]) if len(sources) == 1 else "mixed",
+                "documents": [
+                    {
+                        "index": idx + 1,
+                        "label": Path(upload.filename or source.name).stem,
+                        "filename": upload.filename,
+                        "source_format": source_kind(source),
+                    }
+                    for idx, (upload, source) in enumerate(zip(uploads, sources))
+                ],
             }
         )
     except Exception as exc:
@@ -753,7 +956,7 @@ async def extract_document(
 
     worker = threading.Thread(
         target=_process_extract,
-        args=(run_id, work, source, label, use_ai),
+        args=(run_id, work, sources, label, use_ai),
         daemon=True,
     )
     worker.start()
@@ -783,6 +986,7 @@ def extract_run_meta(run_id: str):
         "traceback": r.get("traceback"),
         "label": r.get("label"),
         "source_format": r.get("source_format"),
+        "documents": r.get("documents", []),
         "supported_upload_formats": supported_input_extensions(),
         "coverage": r.get("coverage"),
         "summary": r.get("summary", {}),
@@ -862,9 +1066,11 @@ def download_extract_json(run_id: str):
         "run_id": run_id,
         "label": r.get("label"),
         "source_format": r.get("source_format"),
+        "documents": r.get("documents", []),
         "coverage": r.get("coverage"),
         "summary": r.get("summary", {}),
         "ai_analysis": r.get("ai_analysis"),
+        "structured_json": _structured_extraction_json(r, run_id),
         "blocks": [_block_record(block, include_payload=True) for block in blocks],
         "tables": tables,
     }
@@ -874,6 +1080,12 @@ def download_extract_json(run_id: str):
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/extract-runs/{run_id}/structured-json")
+def get_extract_structured_json(run_id: str):
+    r = _ensure_extraction_complete(run_id)
+    return _structured_extraction_json(r, run_id)
 
 
 @app.get("/runs/{run_id}")
@@ -1204,9 +1416,13 @@ def get_page(run_id: str, side: str, n: int):
     return FileResponse(imgs[n - 1], media_type="image/png")
 
 
-def _native_change_maps(r: dict, side: str) -> tuple[dict[Any, ChangeType], dict[Any, list[dict[str, Any]]]]:
+def _native_change_maps(
+    r: dict,
+    side: str,
+) -> tuple[dict[Any, ChangeType], dict[Any, list[dict[str, Any]]], dict[Any, list[dict[str, Any]]]]:
     change_by_id: dict[Any, ChangeType] = {}
     fields_by_id: dict[Any, list[dict[str, Any]]] = {}
+    tokens_by_id: dict[Any, list[dict[str, Any]]] = {}
 
     for d in r["diffs"]:
         if d.change_type == ChangeType.UNCHANGED:
@@ -1226,8 +1442,9 @@ def _native_change_maps(r: dict, side: str) -> tuple[dict[Any, ChangeType], dict
             {"field": fd.field, "before": fd.before, "after": fd.after}
             for fd in d.field_diffs
         ]
+        tokens_by_id[block_id] = [_dump_model(td) for td in d.token_diff]
 
-    return change_by_id, fields_by_id
+    return change_by_id, fields_by_id, tokens_by_id
 
 
 def _native_color(change_type: Optional[ChangeType]) -> str:
@@ -1288,7 +1505,7 @@ def get_native_page(run_id: str, side: str, n: int):
 
     blocks = r["base_blocks"] if side == "base" else r["target_blocks"]
     fmt = r.get("base_format") if side == "base" else r.get("target_format")
-    change_by_id, fields_by_id = _native_change_maps(r, side)
+    change_by_id, fields_by_id, tokens_by_id = _native_change_maps(r, side)
 
     table_by_id = {
         b.id: b for b in blocks
@@ -1329,6 +1546,7 @@ def get_native_page(run_id: str, side: str, n: int):
             "highlight": _native_color(change_type),
             "payload": _native_block_payload(block),
             "field_diffs": fields_by_id.get(block.id, []),
+            "token_diff": tokens_by_id.get(block.id, []),
         }
 
         if block.block_type.value == "table":
@@ -1370,6 +1588,7 @@ def get_native_page(run_id: str, side: str, n: int):
                 "highlight": _native_color(change_type),
                 "payload": _native_block_payload(table),
                 "field_diffs": fields_by_id.get(table.id, []),
+                "token_diff": tokens_by_id.get(table.id, []),
                 "header": header,
                 "rows": [
                     _native_row_payload(row, fields_by_id, change_by_id)
@@ -2352,6 +2571,184 @@ def _table_review_rows(row_results: list[dict], limit: int = 25) -> list[dict]:
     return review_rows
 
 
+def _table_header_insights(value_alignment: list[dict], row_results: list[dict]) -> list[dict[str, Any]]:
+    insights = []
+
+    for item in value_alignment:
+        base_col = item.get("base_col")
+        target_col = item.get("target_col")
+        if not base_col or not target_col:
+            continue
+        if _norm_text(base_col) == _norm_text(target_col):
+            continue
+
+        field_name = f"{base_col} -> {target_col}"
+        changed_cells = 0
+        for row in row_results:
+            for fd in row.get("field_diffs") or []:
+                if fd.get("field") == field_name or fd.get("field") == base_col:
+                    changed_cells += 1
+
+        insights.append(
+            {
+                "Baseline Header": base_col,
+                "Revised Header": target_col,
+                "Header Match": f"{round(float(item.get('score') or 0) * 100)}%",
+                "Observation": (
+                    f"Header changed from '{base_col}' to '{target_col}' and {changed_cells} selected row value(s) also changed."
+                    if changed_cells
+                    else f"Header changed from '{base_col}' to '{target_col}', while selected row values appear unchanged in the compared slice."
+                ),
+                "Seek Clarification": "Confirm whether this is only a label/header rename or a business meaning change.",
+            }
+        )
+
+    for item in value_alignment:
+        if item.get("status") == "base_only" and item.get("base_col"):
+            insights.append(
+                {
+                    "Baseline Header": item.get("base_col"),
+                    "Revised Header": "-",
+                    "Header Match": "0%",
+                    "Observation": f"Selected baseline column '{item.get('base_col')}' has no revised counterpart in the selected table slice.",
+                    "Seek Clarification": "Confirm whether the column was removed, moved, renamed, or excluded from the revised template.",
+                }
+            )
+        elif item.get("status") == "target_only" and item.get("target_col"):
+            insights.append(
+                {
+                    "Baseline Header": "-",
+                    "Revised Header": item.get("target_col"),
+                    "Header Match": "0%",
+                    "Observation": f"Selected revised column '{item.get('target_col')}' has no baseline counterpart in the selected table slice.",
+                    "Seek Clarification": "Confirm whether this is a newly introduced value/attribute or a renamed baseline column.",
+                }
+            )
+
+    return insights
+
+
+def _compact_table_rows_for_ai(row_results: list[dict], limit: int = 80) -> list[dict[str, Any]]:
+    rows = []
+
+    for row in row_results[:limit]:
+        rows.append(
+            {
+                "change_type": row.get("change_type"),
+                "match_score": row.get("match_score"),
+                "row_key": row.get("row_key"),
+                "row_definition": row.get("row_definition"),
+                "field_diffs": row.get("field_diffs", [])[:12],
+                "base_values": row.get("base_row", {}).get("values") if isinstance(row.get("base_row"), dict) else row.get("base_values"),
+                "target_values": row.get("target_row", {}).get("values") if isinstance(row.get("target_row"), dict) else row.get("target_values"),
+            }
+        )
+
+    return rows
+
+
+def _ai_selected_table_review(
+    *,
+    question: str,
+    base_table: dict[str, Any],
+    target_table: dict[str, Any],
+    base_row_columns: list[str],
+    target_row_columns: list[str],
+    base_value_columns: list[str],
+    target_value_columns: list[str],
+    value_alignment: list[dict],
+    counts: dict[str, int],
+    row_results: list[dict],
+    header_insights: list[dict[str, Any]],
+) -> dict[str, Any]:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    deployment = (
+        os.getenv("AZURE_OPENAI_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        or os.getenv("AZURE_OPENAI_MODEL")
+    )
+
+    if not (endpoint and api_key and deployment):
+        return {
+            "available": False,
+            "error": "Azure OpenAI is not configured.",
+        }
+
+    prompt_payload = {
+        "question": question or "Review the selected table comparison and summarize meaningful changes.",
+        "base_table": {
+            "name": base_table.get("display_name"),
+            "page": base_table.get("page_label"),
+            "area": base_table.get("area"),
+            "columns": base_table.get("columns"),
+        },
+        "target_table": {
+            "name": target_table.get("display_name"),
+            "page": target_table.get("page_label"),
+            "area": target_table.get("area"),
+            "columns": target_table.get("columns"),
+        },
+        "selected_columns": {
+            "base_row_columns": base_row_columns,
+            "target_row_columns": target_row_columns,
+            "base_value_columns": base_value_columns,
+            "target_value_columns": target_value_columns,
+        },
+        "column_alignment": value_alignment,
+        "header_insights": header_insights,
+        "counts": counts,
+        "changed_rows": _compact_table_rows_for_ai(row_results),
+    }
+
+    try:
+        from openai import AzureOpenAI
+
+        client = AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+        )
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are DocuLens table reviewer. Use only the selected table evidence. "
+                        "Do not invent rows, columns, values, or business meaning. "
+                        "If headers changed but values stayed the same, say that explicitly. "
+                        "Return strict JSON only with keys answer, columns, rows, confidence. "
+                        "Rows should be useful business review rows."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt_payload, ensure_ascii=False, default=str),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=2200,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("AI returned a non-object response")
+        return {
+            "available": True,
+            "answer": str(data.get("answer") or "").strip(),
+            "columns": [str(c) for c in data.get("columns", [])] if isinstance(data.get("columns"), list) else [],
+            "rows": data.get("rows", []) if isinstance(data.get("rows"), list) else [],
+            "confidence": data.get("confidence"),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": f"Azure OpenAI selected-table review failed: {type(exc).__name__}: {exc}",
+        }
+
+
 def _row_matches_filter(row: Block, row_columns: list[str], row_filter: Optional[str], table: Optional[Block] = None, columns: Optional[list[str]] = None) -> bool:
     if not row_filter:
         return True
@@ -2565,6 +2962,25 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
             break
 
     review_rows = _table_review_rows(row_results)
+    header_insights = _table_header_insights(value_alignment, row_results)
+    base_table_matrix = _table_matrix(base_table, r["base_blocks"], include_rows=False)
+    target_table_matrix = _table_matrix(target_table, r["target_blocks"], include_rows=False)
+    ai_review = None
+
+    if req.use_ai:
+        ai_review = _ai_selected_table_review(
+            question=req.question or "Review this selected table comparison. Highlight changed values, unchanged values with changed headers, and clarification questions.",
+            base_table=base_table_matrix,
+            target_table=target_table_matrix,
+            base_row_columns=base_row_columns,
+            target_row_columns=target_row_columns,
+            base_value_columns=base_value_columns,
+            target_value_columns=target_value_columns,
+            value_alignment=value_alignment,
+            counts=counts,
+            row_results=row_results,
+            header_insights=header_insights,
+        )
 
     return {
         "view": "table_comparison",
@@ -2579,8 +2995,11 @@ def compare_table_columns(run_id: str, req: CompareTableColumnsReq):
         ),
         "review_columns": ["Feature", "Change", "Seek Clarification", "Change Type", "Confidence"],
         "review_rows": review_rows,
-        "base_table": _table_matrix(base_table, r["base_blocks"], include_rows=False),
-        "target_table": _table_matrix(target_table, r["target_blocks"], include_rows=False),
+        "header_insight_columns": ["Baseline Header", "Revised Header", "Header Match", "Observation", "Seek Clarification"],
+        "header_insights": header_insights,
+        "ai_review": ai_review,
+        "base_table": base_table_matrix,
+        "target_table": target_table_matrix,
         "base_preview": _table_view_payload(base_table, r["base_blocks"], base_row_columns + base_value_columns, req.row_filter, limit=30),
         "target_preview": _table_view_payload(target_table, r["target_blocks"], target_row_columns + target_value_columns, req.row_filter, limit=30),
         "base_row_columns": base_row_columns,
