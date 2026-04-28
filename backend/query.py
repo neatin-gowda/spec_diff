@@ -42,6 +42,10 @@ AI_ENV_NAMES = {
 }
 
 
+AI_EVIDENCE_BUDGET_CHARS = int(os.getenv("AI_EVIDENCE_BUDGET_CHARS", "60000"))
+AI_EVIDENCE_RETRY_BUDGET_CHARS = int(os.getenv("AI_EVIDENCE_RETRY_BUDGET_CHARS", "28000"))
+
+
 _KEY_RX = re.compile(r"\b([A-Z0-9]{2,6}[A-Z]?)\b")
 _NUMBER_RX = re.compile(r"\b\d{2,6}\b")
 _QUOTED_RX = re.compile(r"[\"']([^\"']{2,80})[\"']")
@@ -216,6 +220,53 @@ def _preview(s: Any, limit: int = 360) -> str | None:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "..."
+
+
+def _payload_search_text(payload: Any, limit: int = 3500) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    useful = {}
+    for key, value in payload.items():
+        key_text = str(key)
+        if key_text.startswith("__") or key_text in _INTERNAL_TABLE_FIELDS:
+            continue
+        if key_text in {"page_width", "page_height", "source_extraction", "visual_match_score", "visual_match_source"}:
+            continue
+        useful[key_text] = value
+
+    if not useful:
+        return ""
+
+    text = json.dumps(useful, ensure_ascii=False, default=str)
+    return text[:limit]
+
+
+def _field_diff_search_text(field_diffs: Any) -> str:
+    if not field_diffs:
+        return ""
+
+    pieces = []
+    for fd in field_diffs[:30]:
+        field = getattr(fd, "field", None) if not isinstance(fd, dict) else fd.get("field")
+        before = getattr(fd, "before", None) if not isinstance(fd, dict) else fd.get("before")
+        after = getattr(fd, "after", None) if not isinstance(fd, dict) else fd.get("after")
+        pieces.append(f"{field}: {before} -> {after}")
+
+    return " | ".join(pieces)
+
+
+def _diff_search_text(d: BlockDiff, base: Block | None, target: Block | None, block: Block) -> str:
+    parts = [
+        base.text if base else None,
+        target.text if target else None,
+        block.path,
+        block.stable_key,
+        _payload_search_text(base.payload if base else None),
+        _payload_search_text(target.payload if target else None),
+        _field_diff_search_text(d.field_diffs),
+    ]
+    return " ".join(str(part) for part in parts if part)
 
 
 def _path_label(path: str | None) -> str:
@@ -718,7 +769,9 @@ def parse_query(nl: str) -> dict:
         if any(w in nl_low for w in words):
             change_types.append(ct)
 
-    if not change_types:
+    if _is_summary_intent(nl) or any(term in nl_low for term in ("key change", "what changed", "what is changed", "difference", "differences")):
+        change_types = ["ADDED", "DELETED", "MODIFIED"]
+    elif not change_types:
         change_types = ["ADDED", "DELETED", "MODIFIED"]
 
     sections: list[str] = []
@@ -821,7 +874,7 @@ def execute_plan(
 
         before = _preview(b.text if b else None)
         after = _preview(t.text if t else None)
-        combined_text = " ".join(str(x) for x in [before, after, block.path, block.stable_key] if x)
+        combined_text = _diff_search_text(d, b, t, block)
         combined_low = _norm(combined_text)
         path_low = _norm(block.path)
         key_up = (block.stable_key or "").upper()
@@ -837,7 +890,8 @@ def execute_plan(
         has_explicit_filter = bool(want_sections or want_keys or want_categories)
         if not has_explicit_filter and query_terms:
             if not any(term in combined_low for term in query_terms):
-                if len(query_terms) > 2:
+                fuzzy = fuzz.partial_ratio(query_text, combined_low) / 100.0 if combined_low else 0.0
+                if len(query_terms) > 2 and fuzzy < 0.52:
                     continue
 
         confidence = _confidence(d, block)
@@ -936,7 +990,7 @@ def llm_plan(nl: str) -> Optional[dict]:
         return None
 
 
-def _semantic_search(nl: str, db_run_id: Optional[str], limit: int = 16) -> list[dict]:
+def _semantic_search(nl: str, db_run_id: Optional[str], limit: int = 48) -> list[dict]:
     if not db_run_id or not db_enabled():
         return []
 
@@ -1116,12 +1170,12 @@ def _focused_identifier_rows(rows: list[dict], nl: str, limit: int = 90) -> list
 
 def _ai_evidence_limit(nl: str, rows: list[dict]) -> int:
     if _is_table_intent(nl) or _identifier_terms(nl):
-        return 180
+        return 90
     if _is_summary_intent(nl) or _is_feature_review_table_intent(nl):
-        return 220 if len(rows) > 120 else 140
+        return 100 if len(rows) > 120 else 70
     if _wants_table_output(nl):
-        return 160
-    return 90
+        return 80
+    return 45
 
 
 def _count_changes(rows: list[dict]) -> dict[str, int]:
@@ -1397,6 +1451,111 @@ def _is_out_of_scope_question(nl: str) -> bool:
     return not (identifier_like or any(term in q for term in document_terms))
 
 
+def _compact_value(value: Any, limit: int = 420) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _preview(value, limit)
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, list):
+        compact = [_compact_value(v, max(80, limit // 3)) for v in value[:12]]
+        if len(value) > 12:
+            compact.append(f"... {len(value) - 12} more")
+        return compact
+    if isinstance(value, dict):
+        out = {}
+        for idx, (key, val) in enumerate(value.items()):
+            if idx >= 18:
+                out["__more__"] = f"{len(value) - 18} more fields"
+                break
+            out[str(key)[:80]] = _compact_value(val, max(80, limit // 3))
+        return out
+    return _preview(str(value), limit)
+
+
+def _compact_field_changes(field_changes: Any, limit: int = 8) -> list[dict]:
+    out = []
+    if not isinstance(field_changes, list):
+        return out
+
+    for fd in field_changes[:limit]:
+        if not isinstance(fd, dict):
+            continue
+        out.append(
+            {
+                "field": _preview(fd.get("field") or fd.get("column") or "value", 120),
+                "before": _compact_value(fd.get("before"), 220),
+                "after": _compact_value(fd.get("after"), 220),
+            }
+        )
+
+    if len(field_changes) > limit:
+        out.append({"field": "__more__", "before": None, "after": f"{len(field_changes) - limit} more cell changes"})
+
+    return out
+
+
+def _compact_evidence_row(row: dict, detail_limit: int = 420) -> dict:
+    out = {
+        "area": _preview(row.get("area") or _path_label(row.get("path")), 180),
+        "change_type": row.get("change_type"),
+        "category": row.get("category"),
+        "before": _compact_value(row.get("before"), detail_limit),
+        "after": _compact_value(row.get("after"), detail_limit),
+        "change": _compact_value(_human_change(row, detail_limit), detail_limit),
+        "citation": _preview(row.get("citation"), 180),
+        "confidence": row.get("confidence"),
+    }
+
+    for key in ("row_key", "stable_key", "page_base", "page_target"):
+        if row.get(key) is not None:
+            out[key] = _compact_value(row.get(key), 120)
+
+    field_changes = _compact_field_changes(row.get("field_changes") or row.get("cell_diffs"), limit=10)
+    if field_changes:
+        out["field_changes"] = field_changes
+
+    values = row.get("values")
+    if values:
+        out["values"] = _compact_value(values, 260)
+
+    table_header = row.get("table_header")
+    if table_header:
+        out["table_header"] = _compact_value(table_header, 180)
+
+    column_alignment = row.get("column_alignment")
+    if column_alignment:
+        out["column_alignment"] = _compact_value(column_alignment, 260)
+
+    definition = row.get("definition")
+    if definition:
+        out["definition"] = _compact_value(definition, 220)
+
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
+def _json_char_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _fit_evidence_budget(evidence: list[dict], budget_chars: int) -> list[dict]:
+    fitted = []
+    total = 2
+
+    for row in evidence:
+        row_size = _json_char_len(row) + 1
+        if fitted and total + row_size > budget_chars:
+            break
+        if not fitted and row_size > budget_chars:
+            fitted.append(_compact_evidence_row(row, detail_limit=160))
+            break
+        fitted.append(row)
+        total += row_size
+
+    return fitted
+
+
 def _curated_ai_evidence(nl: str, rows: list[dict], semantic_rows: list[dict], limit: Optional[int] = None) -> list[dict]:
     limit = limit or _ai_evidence_limit(nl, rows)
     focused = _focused_identifier_rows(rows, nl, limit=max(40, min(100, limit // 2)))
@@ -1405,28 +1564,9 @@ def _curated_ai_evidence(nl: str, rows: list[dict], semantic_rows: list[dict], l
 
     evidence = []
     for row in merged:
-        evidence.append(
-            {
-                "area": row.get("area") or _path_label(row.get("path")),
-                "change_type": row.get("change_type"),
-                "category": row.get("category"),
-                "before": _preview(row.get("before"), 700),
-                "after": _preview(row.get("after"), 700),
-                "change": _human_change(row, 700),
-                "field_changes": row.get("field_changes") or [],
-                "definition": row.get("definition"),
-                "values": row.get("values"),
-                "row_key": row.get("row_key"),
-                "table_header": row.get("table_header"),
-                "column_alignment": row.get("column_alignment"),
-                "citation": row.get("citation"),
-                "page_base": row.get("page_base"),
-                "page_target": row.get("page_target"),
-                "confidence": row.get("confidence"),
-            }
-        )
+        evidence.append(_compact_evidence_row(row, detail_limit=520))
 
-    return evidence
+    return _fit_evidence_budget(evidence, AI_EVIDENCE_BUDGET_CHARS)
 
 
 AI_REVIEW_PROMPT = """\
@@ -1503,24 +1643,39 @@ def llm_freeform_answer(
             azure_endpoint=endpoint,
             api_version=str(config.get("api_version") or "2024-08-01-preview"),
         )
-        evidence = json.dumps(evidence_rows, ensure_ascii=False, default=str)
-        resp = client.chat.completions.create(
-            model=deploy,
-            messages=[
-                {"role": "system", "content": "Return strict JSON only. Do not include markdown fences."},
-                {
-                    "role": "user",
-                    "content": AI_REVIEW_PROMPT.format(
-                        question=nl,
-                        evidence=evidence,
-                        response_language=response_language or "source",
-                    ),
-                },
-            ],
-            temperature=0.15,
-            max_tokens=3500,
-            response_format={"type": "json_object"},
-        )
+
+        def _send(evidence_payload: list[dict]):
+            evidence = json.dumps(evidence_payload, ensure_ascii=False, default=str)
+            return client.chat.completions.create(
+                model=deploy,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only. Do not include markdown fences."},
+                    {
+                        "role": "user",
+                        "content": AI_REVIEW_PROMPT.format(
+                            question=nl,
+                            evidence=evidence,
+                            response_language=response_language or "source",
+                        ),
+                    },
+                ],
+                temperature=0.15,
+                max_tokens=3500,
+                response_format={"type": "json_object"},
+            )
+
+        try:
+            resp = _send(evidence_rows)
+        except Exception as first_exc:
+            message = str(first_exc).lower()
+            if "context" not in message and "maximum" not in message and "too many tokens" not in message and "400" not in message:
+                raise
+            evidence_rows = _fit_evidence_budget(
+                [_compact_evidence_row(row, detail_limit=220) for row in evidence_rows],
+                AI_EVIDENCE_RETRY_BUDGET_CHARS,
+            )
+            resp = _send(evidence_rows)
+
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as exc:
         return None, f"Azure OpenAI chat call failed: {type(exc).__name__}: {exc}"
@@ -1685,6 +1840,14 @@ def query(
     if not rows and is_summary:
         plan = _broad_summary_plan(nl)
         rows = execute_plan(plan, diffs, base_blocks, target_blocks)
+
+    if not rows and not is_summary:
+        relaxed_plan = json.loads(json.dumps(plan, ensure_ascii=False, default=str))
+        relaxed_plan.setdefault("filters", {})
+        relaxed_plan["filters"]["text"] = ""
+        rows = execute_plan(relaxed_plan, diffs, base_blocks, target_blocks)
+        if rows:
+            plan = relaxed_plan
 
     table_rows = []
     if table_result is not None:
