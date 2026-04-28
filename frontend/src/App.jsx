@@ -1198,6 +1198,7 @@ function ExtractionJsonPreview({ runId, meta }) {
   const data = state.data || {};
   const fields = data.semantic_fields || [];
   const tables = data.tables || [];
+  const businessDocs = data.business_structure?.documents || [];
 
   return (
     <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, .95fr) minmax(0, 1.05fr)", gap: 14, alignItems: "start" }}>
@@ -1240,6 +1241,13 @@ function ExtractionJsonPreview({ runId, meta }) {
           )}
         </div>
 
+        {businessDocs.length > 0 && (
+          <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+            <div style={{ fontWeight: 650, marginBottom: 8 }}>Business structure preview</div>
+            <BusinessStructurePreview documents={businessDocs} />
+          </div>
+        )}
+
         <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
           <div style={{ fontWeight: 650, marginBottom: 8 }}>JSON payload preview</div>
           <pre className="dl-scrollbar" style={{ margin: 0, maxHeight: 360, overflow: "auto", background: "#fbfaf6", border: "1px solid #e0d8ca", borderRadius: 8, padding: 12, fontSize: 12, lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
@@ -1270,6 +1278,83 @@ function ExtractionPreview({ runId, meta }) {
         />
       </div>
     </div>
+  );
+}
+
+function BusinessStructurePreview({ documents }) {
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      {documents.slice(0, 4).map((doc) => (
+        <div key={doc.document_index || doc.label} style={{ border: "1px solid #e0d8ca", borderRadius: 8, background: "#fffdf8", padding: 10 }}>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>
+            {doc.label || `Document ${doc.document_index || ""}`}
+          </div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {(doc.sections || []).slice(0, 8).map((section, idx) => (
+              <BusinessSectionCard key={`${section.path || section.title}-${idx}`} section={section} />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BusinessSectionCard({ section }) {
+  const fields = section.fields || [];
+  const inlineRecords = section.inline_records || [];
+  const tables = section.tables || [];
+  const content = section.content || [];
+
+  return (
+    <details open={false} style={{ border: "1px solid #e9dfd0", borderRadius: 7, background: "#fbfaf6", padding: 9 }}>
+      <summary style={{ cursor: "pointer", fontWeight: 650, color: "#344054" }}>
+        {section.title || "Section"} <span style={{ color: "#667085", fontWeight: 500 }}>p.{section.page || "-"}</span>
+      </summary>
+      <div style={{ marginTop: 9, display: "grid", gap: 8 }}>
+        {fields.length > 0 && (
+          <div>
+            <div style={{ fontSize: 12, color: "#667085", fontWeight: 650, marginBottom: 4 }}>Extracted fields</div>
+            <GenericRowsTable columns={["field", "value", "page"]} rows={fields.slice(0, 12)} />
+          </div>
+        )}
+
+        {inlineRecords.length > 0 && (
+          <div>
+            <div style={{ fontSize: 12, color: "#667085", fontWeight: 650, marginBottom: 4 }}>Inline records</div>
+            <GenericRowsTable
+              columns={inferColumns(inlineRecords.map((r) => r.values || r))}
+              rows={inlineRecords.slice(0, 10).map((r) => r.values || r)}
+            />
+          </div>
+        )}
+
+        {tables.length > 0 && (
+          <div>
+            <div style={{ fontSize: 12, color: "#667085", fontWeight: 650, marginBottom: 4 }}>Related tables</div>
+            {tables.slice(0, 4).map((table, idx) => (
+              <div key={`${table.title}-${idx}`} style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 12, color: "#344054", fontWeight: 650, marginBottom: 4 }}>
+                  {table.title || "Detected table"} · {table.row_count || 0} rows
+                </div>
+                <TablePreview columns={table.columns || []} rows={table.sample_rows || []} />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {content.length > 0 && (
+          <div>
+            <div style={{ fontSize: 12, color: "#667085", fontWeight: 650, marginBottom: 4 }}>Related content</div>
+            <ul style={{ margin: 0, paddingLeft: 18, color: "#344054", fontSize: 13, lineHeight: 1.45 }}>
+              {content.slice(0, 8).map((item, idx) => (
+                <li key={idx}>{trim(item.text, 220)}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -2917,10 +3002,90 @@ function normalizeStructuredExtractionPayload(payload) {
     summary: payload?.summary || {},
     coverage: payload?.coverage,
     semantic_fields: semanticFields.slice(0, 220),
+    business_structure: buildBusinessStructureFromBlocks(blocks, tables, semanticFields),
     sections: blocks.filter((b) => ["section", "heading"].includes(b.type)).slice(0, 200),
     tables,
     text_blocks: blocks.filter((b) => ["paragraph", "list_item", "kv_pair", "figure"].includes(b.type)).slice(0, 500),
     ai_analysis: payload?.ai_analysis,
+  };
+}
+
+function buildBusinessStructureFromBlocks(blocks, tables, semanticFields) {
+  const docs = [{ document_index: 1, label: "Extracted document", sections: [] }];
+  let current = null;
+
+  blocks
+    .slice()
+    .sort((a, b) => (a.page_number || 1) - (b.page_number || 1) || (a.sequence || 0) - (b.sequence || 0))
+    .forEach((block) => {
+      if (["section", "heading"].includes(block.type)) {
+        current = {
+          title: block.text || block.path || `Page ${block.page_number || 1}`,
+          page: block.page_number || 1,
+          path: block.path,
+          content: [],
+          fields: [],
+          inline_records: [],
+          tables: [],
+        };
+        docs[0].sections.push(current);
+        return;
+      }
+
+      if (!current || current.page !== (block.page_number || 1)) {
+        current = {
+          title: `Page ${block.page_number || 1}`,
+          page: block.page_number || 1,
+          path: `/page_${block.page_number || 1}`,
+          content: [],
+          fields: [],
+          inline_records: [],
+          tables: [],
+        };
+        docs[0].sections.push(current);
+      }
+
+      if (["paragraph", "list_item", "kv_pair", "figure"].includes(block.type)) {
+        const text = block.text || block.payload?.text || "";
+        const itemFields = semanticFields.filter((f) => f.page === block.page_number && f.citation?.includes(block.path || "__no_path__"));
+        const inline = inlineRecordFromText(text);
+        current.content.push({ type: block.type, page: block.page_number, path: block.path, text, fields: itemFields });
+        current.fields.push(...itemFields);
+        if (inline) current.inline_records.push({ ...inline, page: block.page_number, citation: `p.${block.page_number || "-"} - ${block.path || "document"}` });
+      }
+    });
+
+  tables.forEach((table) => {
+    const page = table.page_first || table.page_number || 1;
+    let section = docs[0].sections.find((s) => s.page === page);
+    if (!section) {
+      section = { title: `Page ${page}`, page, path: `/page_${page}`, content: [], fields: [], inline_records: [], tables: [] };
+      docs[0].sections.push(section);
+    }
+    section.tables.push({
+      title: table.display_name || table.title || "Detected table",
+      page_label: table.page_label,
+      columns: table.columns || [],
+      row_count: table.n_rows || 0,
+      sample_rows: (table.rows || table.row_preview || []).slice(0, 8),
+    });
+  });
+
+  return { documents: docs, section_count: docs[0].sections.length };
+}
+
+function inlineRecordFromText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const cells = raw.includes("|")
+    ? raw.split("|").map((x) => x.trim()).filter(Boolean)
+    : raw.split(/\s{3,}/).map((x) => x.trim()).filter(Boolean);
+  if (cells.length < 2) return null;
+  return {
+    record_type: "inline_row",
+    columns: cells.map((_, idx) => `Column ${idx + 1}`),
+    values: Object.fromEntries(cells.map((value, idx) => [`Column ${idx + 1}`, value])),
+    text: raw,
   };
 }
 
