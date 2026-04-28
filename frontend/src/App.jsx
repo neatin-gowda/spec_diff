@@ -78,11 +78,9 @@ const css = `
     border: 1px solid #b7ae9f;
     background: #f9f6ef;
     min-height: 520px;
-    max-height: calc(100vh - 290px);
-    overflow: auto;
+    overflow: visible;
   }
   .doc-frame.native {
-    overflow: auto;
     background: #f7f2e9;
   }
   .native-page {
@@ -93,7 +91,7 @@ const css = `
     color: #1f2937;
   }
   .native-page.document {
-    max-width: 860px;
+    max-width: 980px;
     margin: 0 auto;
     background: #fffdf8;
     box-shadow: 0 1px 4px rgba(31,41,55,.08);
@@ -113,15 +111,15 @@ const css = `
   .native-token-delete,
   .native-token-replace-base {
     color: #9f2525;
-    background: rgba(218,54,54,.12);
+    background: rgba(218,54,54,.16);
     text-decoration: line-through;
     text-decoration-thickness: 1px;
   }
   .native-token-insert,
   .native-token-replace-target {
     color: #176c38;
-    background: rgba(31,160,70,.13);
-    font-weight: 650;
+    background: rgba(31,160,70,.16);
+    font-weight: 600;
   }
   .native-table-wrap {
     max-width: 100%;
@@ -1184,11 +1182,7 @@ function ExtractionJsonPreview({ runId, meta }) {
   useEffect(() => {
     let cancelled = false;
     setState({ loading: true, error: "", data: null });
-    fetch(`${API}/extract-runs/${runId}/structured-json`)
-      .then(async (resp) => {
-        if (!resp.ok) throw new Error(await readResponseError(resp));
-        return resp.json();
-      })
+    fetchStructuredExtraction(runId)
       .then((data) => {
         if (!cancelled) setState({ loading: false, error: "", data });
       })
@@ -1213,7 +1207,7 @@ function ExtractionJsonPreview({ runId, meta }) {
           <strong>Actual page {page} / {total}</strong>
           <button disabled={page >= total} onClick={() => setPage(Math.min(total, page + 1))} style={navButtonStyle(page >= total)}>Next</button>
         </div>
-        <div className="doc-frame" style={{ display: "flex", justifyContent: "center", padding: 10, maxHeight: "calc(100vh - 330px)", overflow: "auto" }}>
+        <div className="doc-frame" style={{ display: "flex", justifyContent: "center", padding: 10 }}>
           <img
             alt={`Actual document page ${page}`}
             src={`${API}/extract-runs/${runId}/pages/${page}`}
@@ -1546,7 +1540,7 @@ function NativePageView({ page, side }) {
 function NativeItem({ item, viewerType, side }) {
   const highlight = nativeHighlightStyle(item.highlight);
 
-  if (item.type === "table") {
+  if (item.type === "table" && !item.payload?.layout_table) {
     return <NativeTable item={item} viewerType={viewerType} />;
   }
 
@@ -1577,13 +1571,15 @@ function NativeTokenText({ item, side }) {
   const hasTokenDiff = item.highlight === "modified" && Array.isArray(tokens) && tokens.some((t) => t.op && t.op !== "equal");
 
   if (!hasTokenDiff) {
-    return item.text || item.payload?.text || item.path || "-";
+    return item.text || item.payload?.text || item.payload?.layout_text || item.path || "-";
   }
 
   return (
     <span>
       {tokens.map((token, idx) => {
         const op = token.op;
+        if (op === "delete" && side !== "base") return null;
+        if (op === "insert" && side === "base") return null;
         const text =
           op === "equal"
             ? token.text_a
@@ -1667,7 +1663,7 @@ function nativeHighlightStyle(kind, compact = false) {
   }
   if (kind === "modified") {
     return {
-      background: compact ? COLORS.MODIFIED.bg : "rgba(218,185,42,.11)",
+      background: compact ? "rgba(218,185,42,.10)" : "rgba(218,185,42,.08)",
       border: compact ? undefined : `1px solid ${COLORS.MODIFIED.border}`,
       borderLeft: `3px solid ${COLORS.MODIFIED.border}`,
     };
@@ -2856,6 +2852,103 @@ function friendlyFetchError(err) {
     return "The app could not reach the comparison service. Please confirm the backend is running and the API URL is correct.";
   }
   return message || "Something went wrong while processing the documents.";
+}
+
+async function fetchStructuredExtraction(runId) {
+  const structuredResp = await fetch(`${API}/extract-runs/${runId}/structured-json`);
+  if (structuredResp.ok) return structuredResp.json();
+
+  const jsonResp = await fetch(`${API}/extract-runs/${runId}/json`);
+  if (!jsonResp.ok) throw new Error(await readResponseError(structuredResp));
+
+  const payload = await jsonResp.json();
+  return normalizeStructuredExtractionPayload(payload);
+}
+
+function normalizeStructuredExtractionPayload(payload) {
+  if (payload?.structured_json) return payload.structured_json;
+
+  const blocks = payload?.blocks || [];
+  const tables = payload?.tables || [];
+  const semanticFields = [];
+
+  blocks.forEach((block) => {
+    const text = block.text || block.payload?.text || "";
+    const match = String(text).match(/^\s*([^:：]{2,80})\s*[:：]\s*(.{1,300})$/);
+    if (match) {
+      semanticFields.push({
+        field: match[1].trim(),
+        value: match[2].trim(),
+        page: block.page_number,
+        source: block.type,
+        citation: `p.${block.page_number || "-"} - ${block.path || "document"}`,
+      });
+    }
+
+    inferTextAttributes(text).forEach((item) => {
+      semanticFields.push({
+        ...item,
+        page: block.page_number,
+        source: block.type,
+        citation: `p.${block.page_number || "-"} - ${block.path || "document"}`,
+      });
+    });
+  });
+
+  tables.slice(0, 40).forEach((table) => {
+    (table.rows || []).slice(0, 50).forEach((row) => {
+      Object.entries(row || {}).forEach(([key, value]) => {
+        if (!value || String(key).startsWith("__")) return;
+        semanticFields.push({
+          field: key,
+          value,
+          page: table.page_first || table.page_number,
+          source: "table",
+          table: table.display_name || table.title,
+          citation: `${table.page_label || "page"} - ${table.title || "table"}`,
+        });
+      });
+    });
+  });
+
+  return {
+    run_id: payload?.run_id,
+    documents: payload?.documents || [],
+    summary: payload?.summary || {},
+    coverage: payload?.coverage,
+    semantic_fields: semanticFields.slice(0, 220),
+    sections: blocks.filter((b) => ["section", "heading"].includes(b.type)).slice(0, 200),
+    tables,
+    text_blocks: blocks.filter((b) => ["paragraph", "list_item", "kv_pair", "figure"].includes(b.type)).slice(0, 500),
+    ai_analysis: payload?.ai_analysis,
+  };
+}
+
+function inferTextAttributes(text) {
+  const source = String(text || "");
+  const patterns = [
+    ["color", /\b(?:colou?r|shade)\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z\s/-]{2,40})/gi],
+    ["size", /\b(?:size|dimension)\s*(?:is|=|:)?\s*([A-Z0-9][A-Z0-9\s./x-]{0,40})/gi],
+    ["quantity", /\b(?:qty|quantity|count|units?)\s*(?:is|=|:)?\s*(\d[\d,]*(?:\.\d+)?)/gi],
+    ["price", /([$€£]\s?\d[\d,]*(?:\.\d+)?)/g],
+    ["percentage", /\b(\d+(?:\.\d+)?%)\b/g],
+    ["date", /\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b/g],
+    ["code", /\b([A-Z]{1,8}[- ]?\d{2,12}[A-Z]?)\b/gi],
+  ];
+  const out = [];
+  const seen = new Set();
+
+  patterns.forEach(([field, rx]) => {
+    for (const match of source.matchAll(rx)) {
+      const value = String(match[1] || "").replace(/\s+/g, " ").trim();
+      const key = `${field}:${value.toLowerCase()}`;
+      if (!value || seen.has(key)) continue;
+      seen.add(key);
+      out.push({ field, value });
+    }
+  });
+
+  return out;
 }
 
 function normalizeErrorMessage(value) {
