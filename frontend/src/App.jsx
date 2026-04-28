@@ -1120,10 +1120,16 @@ function ExtractionTables({ runId }) {
               <div style={{ fontWeight: 650 }}>{table.display_name || table.title || "Detected table"}</div>
               <div style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
                 {table.page_label} · {table.n_columns} columns · {table.n_rows} rows · header quality {Math.round((table.header_quality || 0) * 100)}%
+                {table.extraction_confidence ? ` · extraction ${Math.round(table.extraction_confidence * 100)}%` : ""}
               </div>
             </div>
             <code>{String(table.id || "").slice(0, 8)}</code>
           </div>
+          {Array.isArray(table.quality_warnings) && table.quality_warnings.length > 0 && (
+            <div style={{ color: "#8a5a00", fontSize: 13, marginBottom: 8 }}>
+              Review note: {table.quality_warnings.slice(0, 2).join(" ")}
+            </div>
+          )}
           <div style={{ color: "#475467", fontSize: 13, marginBottom: 8 }}>
             Columns: {(table.columns || []).slice(0, 12).join(" | ") || "No columns detected"}
           </div>
@@ -1199,6 +1205,9 @@ function ExtractionJsonPreview({ runId, meta }) {
   const fields = data.semantic_fields || [];
   const tables = data.tables || [];
   const businessDocs = data.business_structure?.documents || [];
+  const intelligence = data.intelligence || data.summary?.intelligence || {};
+  const quality = intelligence.quality || {};
+  const template = intelligence.template || {};
 
   return (
     <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, .95fr) minmax(0, 1.05fr)", gap: 14, alignItems: "start" }}>
@@ -1218,6 +1227,21 @@ function ExtractionJsonPreview({ runId, meta }) {
       </div>
 
       <div style={{ minWidth: 0, display: "grid", gap: 12 }}>
+        <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>Extraction intelligence</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", color: "#344054", fontSize: 13 }}>
+            <span style={softPillStyle}>Template: {template.template_type || "generic document"}</span>
+            <span style={softPillStyle}>Quality: {quality.grade || "not rated"}</span>
+            {Number.isFinite(quality.score) && <span style={softPillStyle}>Score: {Math.round(quality.score * 100)}%</span>}
+            {template.language?.script && <span style={softPillStyle}>Script: {template.language.script}</span>}
+          </div>
+          {Array.isArray(quality.warnings) && quality.warnings.length > 0 && (
+            <div style={{ color: "#8a5a00", fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>
+              {quality.warnings.slice(0, 3).map((w) => w.message || w).join(" ")}
+            </div>
+          )}
+        </div>
+
         <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 8 }}>
             <div>
@@ -2455,6 +2479,7 @@ function TableInfo({ table, emptyLabel }) {
           </div>
           <div style={{ marginTop: 4, color: "#667085", fontSize: 13 }}>
             {table.page_label || `Page ${table.page_first || "-"}`} · {table.n_columns || columns.length} columns · {table.n_rows || 0} rows
+            {table.extraction_confidence ? ` · extraction ${Math.round(table.extraction_confidence * 100)}%` : ""}
           </div>
         </div>
         {table.id && <code>{table.id.slice(0, 8)}</code>}
@@ -2475,9 +2500,16 @@ function TableInfo({ table, emptyLabel }) {
           {table.column_details.slice(0, 14).map((col) => (
             <span key={col.name} title={`${col.name}${col.sample_values?.[0] ? `: ${col.sample_values[0]}` : ""}`} style={{ border: "1px solid #d8d0c3", borderRadius: 999, padding: "2px 7px", fontSize: 12, color: "#475467", background: "#fbfaf6", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {col.name}
+              {col.semantic_role ? ` · ${col.semantic_role}` : ""}
               {col.sample_values?.[0] ? `: ${trim(col.sample_values[0], 24)}` : ""}
             </span>
           ))}
+        </div>
+      )}
+
+      {Array.isArray(table.quality_warnings) && table.quality_warnings.length > 0 && (
+        <div style={{ marginTop: 10, color: "#8a5a00", fontSize: 13, lineHeight: 1.35 }}>
+          {table.quality_warnings.slice(0, 2).join(" ")}
         </div>
       )}
 
@@ -3275,6 +3307,16 @@ const miniButtonStyle = {
   borderRadius: 6,
   padding: "3px 7px",
   cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 600,
+};
+
+const softPillStyle = {
+  border: "1px solid #ded6c8",
+  background: "#fbfaf6",
+  color: "#344054",
+  borderRadius: 999,
+  padding: "4px 8px",
   fontSize: 12,
   fontWeight: 600,
 };
