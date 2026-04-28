@@ -198,12 +198,18 @@ const panelStyle = {
 };
 
 export default function App() {
+  const [workspace, setWorkspace] = useState("home");
   const [runId, setRunId] = useState(null);
   const [meta, setMeta] = useState(null);
   const [tab, setTab] = useState("viewer");
   const [pageNum, setPageNum] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [extractRunId, setExtractRunId] = useState(null);
+  const [extractMeta, setExtractMeta] = useState(null);
+  const [extractBusy, setExtractBusy] = useState(false);
+  const [extractError, setExtractError] = useState("");
+  const [extractTab, setExtractTab] = useState("overview");
 
   useEffect(() => {
     if (!runId || !busy) return;
@@ -249,6 +255,50 @@ export default function App() {
     };
   }, [runId, busy]);
 
+  useEffect(() => {
+    if (!extractRunId || !extractBusy) return;
+
+    let cancelled = false;
+    let timer = null;
+
+    const poll = async () => {
+      try {
+        const resp = await fetch(`${API}/extract-runs/${extractRunId}`);
+        if (!resp.ok) throw new Error(await readResponseError(resp));
+
+        const data = await resp.json();
+        if (cancelled) return;
+
+        setExtractMeta(data);
+
+        if (data.status === "complete") {
+          setExtractBusy(false);
+          setExtractTab("overview");
+          return;
+        }
+
+        if (data.status === "failed") {
+          setExtractBusy(false);
+          setExtractError(normalizeErrorMessage(data.error || data.status_message || "Extraction failed."));
+          return;
+        }
+
+        timer = setTimeout(poll, 1000);
+      } catch (err) {
+        if (cancelled) return;
+        setExtractBusy(false);
+        setExtractError(friendlyFetchError(err));
+      }
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [extractRunId, extractBusy]);
+
   const onUpload = async (e) => {
     e.preventDefault();
 
@@ -261,6 +311,7 @@ export default function App() {
       return;
     }
 
+    setWorkspace("compare");
     setBusy(true);
     setError("");
     setRunId(null);
@@ -299,13 +350,61 @@ export default function App() {
     }
   };
 
+  const onExtractUpload = async (e) => {
+    e.preventDefault();
+
+    const form = new FormData(e.currentTarget);
+    const document = form.get("document");
+
+    if (!document || !document.name) {
+      setExtractError("Please select a PDF or image before starting extraction.");
+      return;
+    }
+
+    setWorkspace("extract");
+    setExtractBusy(true);
+    setExtractError("");
+    setExtractRunId(null);
+    setExtractTab("overview");
+    setExtractMeta({
+      status: "uploading",
+      status_message: "Uploading document",
+      progress: 3,
+      summary: {},
+    });
+
+    try {
+      const resp = await fetch(`${API}/extract`, { method: "POST", body: form });
+      if (!resp.ok) throw new Error(await readResponseError(resp));
+
+      const data = await resp.json();
+      setExtractRunId(data.run_id);
+      setExtractMeta({
+        run_id: data.run_id,
+        status: data.status,
+        status_message: data.status_message || "Starting extraction",
+        progress: data.progress || 5,
+        summary: {},
+      });
+    } catch (err) {
+      setExtractBusy(false);
+      setExtractError(friendlyFetchError(err));
+    }
+  };
+
   const startOver = () => {
+    setWorkspace("home");
     setRunId(null);
     setMeta(null);
     setPageNum(1);
     setTab("viewer");
     setError("");
     setBusy(false);
+    setExtractRunId(null);
+    setExtractMeta(null);
+    setExtractBusy(false);
+    setExtractError("");
+    setExtractTab("overview");
   };
 
   const downloadReport = () => {
@@ -313,14 +412,27 @@ export default function App() {
   };
 
   const isComplete = meta?.status === "complete";
+  const isExtractComplete = extractMeta?.status === "complete";
 
   return (
     <div style={shellStyle}>
       <style>{css}</style>
       <div style={pageStyle}>
-        <Header runId={isComplete ? runId : null} onStartOver={startOver} onDownloadReport={downloadReport} />
+        <Header
+          runId={isComplete ? runId : null}
+          workspace={workspace}
+          onStartOver={startOver}
+          onDownloadReport={downloadReport}
+        />
 
-        {!isComplete && (
+        {workspace === "home" && !isComplete && !isExtractComplete && (
+          <LandingPage
+            onExtract={() => setWorkspace("extract")}
+            onCompare={() => setWorkspace("compare")}
+          />
+        )}
+
+        {workspace === "compare" && !isComplete && (
           <section style={{ ...panelStyle, padding: 22, marginBottom: 16 }}>
             <UploadPanel onUpload={onUpload} busy={busy} />
             {busy && meta && (
@@ -331,6 +443,20 @@ export default function App() {
               />
             )}
             {error && <ErrorBox message={error} />}
+          </section>
+        )}
+
+        {workspace === "extract" && !isExtractComplete && (
+          <section style={{ ...panelStyle, padding: 22, marginBottom: 16 }}>
+            <ExtractUploadPanel onUpload={onExtractUpload} busy={extractBusy} />
+            {extractBusy && extractMeta && (
+              <ProcessingState
+                progress={extractMeta.progress || 0}
+                message={extractMeta.status_message || "Extracting document"}
+                status={extractMeta.status || "running"}
+              />
+            )}
+            {extractError && <ErrorBox message={extractError} />}
           </section>
         )}
 
@@ -347,12 +473,21 @@ export default function App() {
             </main>
           </>
         )}
+
+        {isExtractComplete && extractRunId && extractMeta && (
+          <ExtractionWorkspace
+            runId={extractRunId}
+            meta={extractMeta}
+            tab={extractTab}
+            setTab={setExtractTab}
+          />
+        )}
       </div>
     </div>
   );
 }
 
-function Header({ runId, onStartOver, onDownloadReport }) {
+function Header({ runId, workspace, onStartOver, onDownloadReport }) {
   return (
     <header style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
@@ -380,18 +515,70 @@ function Header({ runId, onStartOver, onDownloadReport }) {
           <p style={{ margin: "6px 0 0", color: "#667085", fontSize: 14 }}>{BRAND.subtitle}</p>
         </div>
 
-        {runId && (
+        {(runId || workspace !== "home") && (
           <div className="header-actions" style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-            <button onClick={onDownloadReport} style={primaryButtonStyle()}>
-              Export PDF report
-            </button>
+            {runId && (
+              <button onClick={onDownloadReport} style={primaryButtonStyle()}>
+                Export PDF report
+              </button>
+            )}
             <button onClick={onStartOver} style={secondaryButtonStyle()}>
-              New comparison
+              New workflow
             </button>
           </div>
         )}
       </div>
     </header>
+  );
+}
+
+function LandingPage({ onExtract, onCompare }) {
+  return (
+    <section style={{ ...panelStyle, padding: 22 }}>
+      <div style={{ marginBottom: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 600 }}>Choose a workspace</h2>
+        <p style={{ margin: "7px 0 0", color: "#667085", fontSize: 14 }}>
+          Use extraction when you want to inspect one file. Use comparison when you want to review old vs revised versions.
+        </p>
+      </div>
+
+      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <WorkspaceCard
+          title="Extract a document"
+          description="Upload one PDF or image and review extracted text, tables, image/OCR content, extraction coverage, JSON, and optional AI analysis."
+          action="Start extraction"
+          onClick={onExtract}
+        />
+        <WorkspaceCard
+          title="Compare documents"
+          description="Upload baseline and revised files, then use the existing side-by-side review, semantic diff, table workspace, Ask Agent, and reports."
+          action="Start comparison"
+          onClick={onCompare}
+        />
+      </div>
+    </section>
+  );
+}
+
+function WorkspaceCard({ title, description, action, onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        textAlign: "left",
+        border: "1px solid #ded6c8",
+        background: "#fbfaf6",
+        borderRadius: 8,
+        padding: 18,
+        cursor: "pointer",
+        color: "#202936",
+      }}
+    >
+      <div style={{ fontSize: 17, fontWeight: 650, marginBottom: 7 }}>{title}</div>
+      <div style={{ color: "#667085", fontSize: 14, lineHeight: 1.45, minHeight: 62 }}>{description}</div>
+      <div style={{ marginTop: 16, color: "#2f5f4f", fontWeight: 650 }}>{action}</div>
+    </button>
   );
 }
 
@@ -448,6 +635,63 @@ function UploadPanel({ onUpload, busy }) {
   );
 }
 
+function ExtractUploadPanel({ onUpload, busy }) {
+  return (
+    <form onSubmit={onUpload}>
+      <div
+        className="upload-grid"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(280px, 1fr) 230px",
+          gap: 16,
+          alignItems: "stretch",
+        }}
+      >
+        <FileInput
+          label="Document or image"
+          helper="PDF or image for extraction. Other document formats can be enabled through the same pipeline."
+          name="document"
+          disabled={busy}
+        />
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <label
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              color: "#475467",
+              fontSize: 14,
+              background: "#fbfaf6",
+              border: "1px solid #ded6c8",
+              borderRadius: 8,
+              padding: "10px 12px",
+              fontWeight: 600,
+            }}
+          >
+            <input type="checkbox" name="use_ai" value="true" disabled={busy} />
+            Optional AI analysis
+          </label>
+
+          <button disabled={busy} style={primaryButtonStyle(busy, { height: 44 })}>
+            {busy ? "Extracting" : "Extract content"}
+          </button>
+
+          <div style={{ color: "#667085", fontSize: 12, lineHeight: 1.35 }}>
+            Extraction runs deterministically first. AI only reviews extracted evidence when enabled.
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
+        <Capability label="Text and structure" detail="Extracts headings, paragraphs, lists, key-values, and page-level content." />
+        <Capability label="Tables" detail="Detects tables, headers, rows, cells, sample values, and table quality signals." />
+        <Capability label="Images and OCR" detail="Uses OCR fallback for scanned pages and image-based content." />
+      </div>
+    </form>
+  );
+}
+
 function FileInput({ label, helper, name, disabled }) {
   const [fileName, setFileName] = useState("");
   const inputRef = useRef(null);
@@ -478,7 +722,7 @@ function FileInput({ label, helper, name, disabled }) {
         ref={inputRef}
         type="file"
         name={name}
-        accept=".pdf,.doc,.docx,.xls,.xlsx,.xlsm,.csv,.tsv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/tab-separated-values"
+        accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.doc,.docx,.xls,.xlsx,.xlsm,.csv,.tsv,application/pdf,image/png,image/jpeg,image/tiff,image/bmp,image/webp,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/tab-separated-values"
         required
         disabled={disabled}
         onClick={(e) => e.stopPropagation()}
@@ -503,7 +747,7 @@ function FileInput({ label, helper, name, disabled }) {
             height: 24,
           }}
         >
-          PDF DOC XLS CSV
+          PDF IMG DOC XLS CSV
         </span>
       </div>
 
@@ -652,6 +896,235 @@ function Tabs({ tab, setTab }) {
         );
       })}
     </nav>
+  );
+}
+
+function ExtractionWorkspace({ runId, meta, tab, setTab }) {
+  return (
+    <>
+      <ExtractionStats meta={meta} />
+      <ExtractionTabs tab={tab} setTab={setTab} />
+      <main style={{ ...panelStyle, padding: 12 }}>
+        {tab === "overview" && <ExtractionOverview runId={runId} meta={meta} />}
+        {tab === "tables" && <ExtractionTables runId={runId} />}
+        {tab === "text" && <ExtractionBlocks runId={runId} />}
+        {tab === "preview" && <ExtractionPreview runId={runId} meta={meta} />}
+      </main>
+    </>
+  );
+}
+
+function ExtractionStats({ meta }) {
+  const summary = meta.summary || {};
+  return (
+    <section style={{ ...panelStyle, padding: 12, display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+      <StatChip label="Format" value={(meta.source_format || "-").toUpperCase()} />
+      <StatChip label="Coverage" value={typeof meta.coverage === "number" ? `${meta.coverage.toFixed(1)}%` : "-"} />
+      <StatChip label="Quality" value={summary.quality || "-"} />
+      <StatChip label="Tables" value={summary.table_count || 0} />
+      <StatChip label="Blocks" value={Object.values(summary.block_counts || {}).reduce((a, b) => a + Number(b || 0), 0)} />
+      <StatChip label="Pages" value={meta.n_pages || meta.native_pages || 0} />
+    </section>
+  );
+}
+
+function ExtractionTabs({ tab, setTab }) {
+  const items = [
+    ["overview", "Extraction overview"],
+    ["tables", "Extracted tables"],
+    ["text", "Text blocks"],
+    ["preview", "Preview"],
+  ];
+  return (
+    <nav style={{ display: "flex", gap: 4, borderBottom: "1px solid #d8d0c3", marginBottom: 12, overflowX: "auto" }}>
+      {items.map(([key, label]) => {
+        const active = tab === key;
+        return (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            style={{
+              padding: "10px 14px",
+              background: active ? "#1f2937" : "transparent",
+              color: active ? "white" : "#344054",
+              border: active ? "1px solid #1f2937" : "1px solid transparent",
+              borderRadius: "8px 8px 0 0",
+              cursor: "pointer",
+              fontWeight: 600,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+function ExtractionOverview({ runId, meta }) {
+  const summary = meta.summary || {};
+  const ai = meta.ai_analysis;
+  const aiResult = ai?.result || null;
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 650 }}>{meta.label || "Extracted document"}</h2>
+          <p style={{ margin: "6px 0 0", color: "#667085", fontSize: 13 }}>{summary.message || "Extraction complete."}</p>
+        </div>
+        <button onClick={() => { window.location.href = `${API}/extract-runs/${runId}/json`; }} style={primaryButtonStyle(false)}>
+          Download JSON
+        </button>
+      </div>
+
+      <div className="report-metrics" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginBottom: 12 }}>
+        <MetricCard label="Extraction coverage" value={typeof meta.coverage === "number" ? `${meta.coverage.toFixed(1)}%` : "-"} />
+        <MetricCard label="Tables detected" value={summary.table_count || 0} />
+        <MetricCard label="Table rows" value={summary.table_row_count || 0} />
+        <MetricCard label="Image/OCR blocks" value={summary.figure_count || 0} />
+      </div>
+
+      <div style={{ ...panelStyle, padding: 14, boxShadow: "none", marginBottom: 12 }}>
+        <div style={{ fontWeight: 650, marginBottom: 8 }}>Block breakdown</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {Object.entries(summary.block_counts || {}).map(([key, value]) => (
+            <StatChip key={key} label={key.replace("_", " ")} value={value} />
+          ))}
+          {Object.keys(summary.block_counts || {}).length === 0 && <span style={{ color: "#667085" }}>No block statistics available.</span>}
+        </div>
+      </div>
+
+      {ai && (
+        <div style={{ ...panelStyle, padding: 14, boxShadow: "none" }}>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>
+            AI-assisted analysis {ai.available ? "- available" : "- unavailable"}
+          </div>
+          {!ai.available && <div style={{ color: COLORS.DELETED.text }}>{ai.error || "AI analysis was not generated."}</div>}
+          {aiResult && (
+            <div style={{ color: "#344054", lineHeight: 1.5 }}>
+              <p style={{ marginTop: 0 }}>{aiResult.executive_summary || "AI analysis completed."}</p>
+              {Array.isArray(aiResult.key_items) && aiResult.key_items.length > 0 && (
+                <GenericRowsTable
+                  columns={["Item"]}
+                  rows={aiResult.key_items.slice(0, 20).map((item) => ({ Item: typeof item === "string" ? item : JSON.stringify(item) }))}
+                />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExtractionTables({ runId }) {
+  const [state, setState] = useState({ loading: true, error: "", tables: [] });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ loading: true, error: "", tables: [] });
+    fetch(`${API}/extract-runs/${runId}/tables?include_rows=true`)
+      .then(async (resp) => {
+        if (!resp.ok) throw new Error(await readResponseError(resp));
+        return resp.json();
+      })
+      .then((data) => {
+        if (!cancelled) setState({ loading: false, error: "", tables: data.tables || [] });
+      })
+      .catch((err) => {
+        if (!cancelled) setState({ loading: false, error: friendlyFetchError(err), tables: [] });
+      });
+    return () => { cancelled = true; };
+  }, [runId]);
+
+  if (state.loading) return <SoftLoading label="Loading extracted tables..." />;
+  if (state.error) return <ErrorBox message={state.error} />;
+  if (!state.tables.length) return <EmptyState label="No tables were detected in this document." />;
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      {state.tables.map((table) => (
+        <div key={table.id} style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+            <div>
+              <div style={{ fontWeight: 650 }}>{table.display_name || table.title || "Detected table"}</div>
+              <div style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
+                {table.page_label} · {table.n_columns} columns · {table.n_rows} rows · header quality {Math.round((table.header_quality || 0) * 100)}%
+              </div>
+            </div>
+            <code>{String(table.id || "").slice(0, 8)}</code>
+          </div>
+          <div style={{ color: "#475467", fontSize: 13, marginBottom: 8 }}>
+            Columns: {(table.columns || []).slice(0, 12).join(" | ") || "No columns detected"}
+          </div>
+          <TablePreview columns={table.columns || []} rows={table.rows || table.row_preview || []} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExtractionBlocks({ runId }) {
+  const [state, setState] = useState({ loading: true, error: "", blocks: [] });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ loading: true, error: "", blocks: [] });
+    fetch(`${API}/extract-runs/${runId}/blocks?limit=1000`)
+      .then(async (resp) => {
+        if (!resp.ok) throw new Error(await readResponseError(resp));
+        return resp.json();
+      })
+      .then((data) => {
+        if (!cancelled) setState({ loading: false, error: "", blocks: data.blocks || [] });
+      })
+      .catch((err) => {
+        if (!cancelled) setState({ loading: false, error: friendlyFetchError(err), blocks: [] });
+      });
+    return () => { cancelled = true; };
+  }, [runId]);
+
+  if (state.loading) return <SoftLoading label="Loading extracted text blocks..." />;
+  if (state.error) return <ErrorBox message={state.error} />;
+
+  const rows = state.blocks
+    .filter((block) => block.text || block.type === "table")
+    .slice(0, 500)
+    .map((block) => ({
+      Page: block.page_number,
+      Type: block.type,
+      Path: block.path,
+      Text: trim(block.text || JSON.stringify(block.payload || {}), 700),
+    }));
+
+  return rows.length ? (
+    <GenericRowsTable columns={["Page", "Type", "Path", "Text"]} rows={rows} />
+  ) : (
+    <EmptyState label="No extracted text blocks were returned." />
+  );
+}
+
+function ExtractionPreview({ runId, meta }) {
+  const [page, setPage] = useState(1);
+  const total = meta.n_pages || 1;
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+        <button disabled={page <= 1} onClick={() => setPage(Math.max(1, page - 1))} style={navButtonStyle(page <= 1)}>Prev</button>
+        <strong>Page {page} / {total}</strong>
+        <button disabled={page >= total} onClick={() => setPage(Math.min(total, page + 1))} style={navButtonStyle(page >= total)}>Next</button>
+      </div>
+      <div className="doc-frame" style={{ display: "flex", justifyContent: "center", padding: 10 }}>
+        <img
+          alt={`Extracted preview page ${page}`}
+          src={`${API}/extract-runs/${runId}/pages/${page}`}
+          style={{ maxWidth: "100%", height: "auto", display: "block" }}
+        />
+      </div>
+    </div>
   );
 }
 
