@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterable, Optional
 import fitz
 from rapidfuzz import fuzz
 
+from .extraction.runner import enrich_blocks
 from .models import Block, BlockType, TemplateProfile
 
 
@@ -953,9 +954,17 @@ def extract_blocks_from_source(
     intentionally generic and template-free in this first release.
     """
     ext = source_path.suffix.lower()
+    source_format = source_kind(source_path)
+    document_label = source_path.stem
 
     if ext in {".pdf", *IMAGE_EXTENSIONS}:
-        return pdf_extractor(str(pdf_path))
+        blocks = pdf_extractor(str(pdf_path))
+        return enrich_blocks(
+            blocks,
+            source_path=source_path,
+            source_format=source_format,
+            document_label=document_label,
+        )
 
     blocks: list[Block] = []
     if ext == ".docx":
@@ -965,10 +974,22 @@ def extract_blocks_from_source(
 
     if blocks:
         visual_blocks = pdf_extractor(str(pdf_path))
-        return _attach_visual_bboxes(blocks, visual_blocks)
+        blocks = _attach_visual_bboxes(blocks, visual_blocks)
+        return enrich_blocks(
+            blocks,
+            source_path=source_path,
+            source_format=source_format,
+            document_label=document_label,
+        )
 
     # DOC/legacy XLS or parser failure: use the converted PDF as a safe fallback.
-    return pdf_extractor(str(pdf_path))
+    blocks = pdf_extractor(str(pdf_path))
+    return enrich_blocks(
+        blocks,
+        source_path=source_path,
+        source_format=source_format,
+        document_label=document_label,
+    )
 
 
 def coverage_for_source(source_path: Path, pdf_path: Path, blocks: list[Block], pdf_coverage: Callable[[str, list[Block]], float]) -> float:
