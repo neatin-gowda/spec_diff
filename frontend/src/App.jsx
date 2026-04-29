@@ -1194,7 +1194,6 @@ function ExtractionWorkspace({ runId, meta, tab, setTab }) {
         {tab === "tables" && <ExtractionTables runId={runId} />}
         {tab === "text" && <ExtractionBlocks runId={runId} />}
         {tab === "json" && <ExtractionJsonPreview runId={runId} meta={meta} />}
-        {tab === "preview" && <ExtractionPreview runId={runId} meta={meta} />}
       </main>
     </>
   );
@@ -1224,7 +1223,6 @@ function ExtractionTabs({ tab, setTab }) {
     ["tables", "Extracted tables"],
     ["text", "Text blocks"],
     ["json", "Structured JSON"],
-    ["preview", "Preview"],
   ];
   return (
     <nav style={{ display: "flex", gap: 4, borderBottom: "1px solid #d8d0c3", marginBottom: 12, overflowX: "auto" }}>
@@ -1407,8 +1405,6 @@ function ExtractionBlocks({ runId }) {
 
 function ExtractionJsonPreview({ runId, meta }) {
   const [state, setState] = useState({ loading: true, error: "", data: null });
-  const [page, setPage] = useState(1);
-  const total = meta.n_pages || meta.native_pages || 1;
 
   useEffect(() => {
     let cancelled = false;
@@ -1427,32 +1423,20 @@ function ExtractionJsonPreview({ runId, meta }) {
   if (state.error) return <ErrorBox message={state.error} />;
 
   const data = state.data || {};
-  const fields = data.semantic_fields || [];
   const tables = data.tables || [];
   const pages = data.pages || [];
-  const businessDocs = data.business_structure?.documents || [];
+  const content = data.content || pages.flatMap((pageItem) => pageItem.content || []);
   const documentSummary = data.document_summary || {};
   const quality = documentSummary.extraction_quality || {};
+  const inferredRecords = content
+    .map((item) => item.inferred_record)
+    .filter(Boolean);
 
   return (
-    <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, .95fr) minmax(0, 1.05fr)", gap: 14, alignItems: "start" }}>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
-          <button disabled={page <= 1} onClick={() => setPage(Math.max(1, page - 1))} style={navButtonStyle(page <= 1)}>Prev</button>
-          <strong>Actual page {page} / {total}</strong>
-          <button disabled={page >= total} onClick={() => setPage(Math.min(total, page + 1))} style={navButtonStyle(page >= total)}>Next</button>
-        </div>
-        <div className="doc-frame" style={{ display: "flex", justifyContent: "center", padding: 10 }}>
-          <img
-            alt={`Actual document page ${page}`}
-            src={`${API}/extract-runs/${runId}/pages/${page}`}
-            style={{ maxWidth: "100%", height: "auto", display: "block" }}
-          />
-        </div>
-      </div>
-
-      <div style={{ minWidth: 0, display: "grid", gap: 12 }}>
-        <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
           <div style={{ fontWeight: 650, marginBottom: 8 }}>Business extraction summary</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", color: "#344054", fontSize: 13 }}>
             <span style={softPillStyle}>Document: {documentSummary.label || meta.label || "uploaded file"}</span>
@@ -1462,6 +1446,11 @@ function ExtractionJsonPreview({ runId, meta }) {
             {Number.isFinite(quality.score) && <span style={softPillStyle}>Score: {Math.round(quality.score * 100)}%</span>}
             {documentSummary.detected_language && <span style={softPillStyle}>Script: {documentSummary.detected_language}</span>}
           </div>
+          </div>
+          <button onClick={() => { window.location.href = `${API}/extract-runs/${runId}/json`; }} style={secondaryButtonStyle()}>
+            Download clean JSON
+          </button>
+        </div>
           {Array.isArray(quality.warnings) && quality.warnings.length > 0 && (
             <div style={{ color: "#8a5a00", fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>
               {quality.warnings.slice(0, 3).map((w) => w.message || w).join(" ")}
@@ -1469,32 +1458,50 @@ function ExtractionJsonPreview({ runId, meta }) {
           )}
         </div>
 
-	      <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+      <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 8 }}>
             <div>
-              <div style={{ fontWeight: 650 }}>Readable extraction JSON</div>
+              <div style={{ fontWeight: 650 }}>Document-order extracted text</div>
               <div style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
-	                {fields.length} field(s), {tables.length} table(s), {data.sections?.length || 0} section(s), {pages.length} page block(s)
+                {content.length} text block(s), {inferredRecords.length} inferred record(s), {tables.length} table(s), {pages.length} page(s)
               </div>
             </div>
-            <button onClick={() => { window.location.href = `${API}/extract-runs/${runId}/json`; }} style={secondaryButtonStyle()}>
-              Download JSON
-            </button>
           </div>
 
-          {fields.length > 0 ? (
+          {content.length > 0 ? (
             <GenericRowsTable
-              columns={["field", "value", "page", "source", "citation"]}
-              rows={fields.slice(0, 80)}
+              columns={["Page", "Type", "Path", "Text", "Inferred record"]}
+              rows={content.slice(0, 500).map((item) => ({
+                Page: item.page,
+                Type: item.type,
+                Path: item.path,
+                Text: trim(item.text, 900),
+                "Inferred record": item.inferred_record ? recordSummary(item.inferred_record.values) : "",
+              }))}
             />
           ) : (
-            <EmptyState label="No key-value fields were detected. Check extracted tables and text blocks." />
+            <EmptyState label="No ordered text content was returned. Check the Text blocks tab." />
           )}
         </div>
 
+      {inferredRecords.length > 0 && (
+        <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>Inferred business records</div>
+          <GenericRowsTable
+            columns={["Page", "Values", "Source text", "Citation"]}
+            rows={inferredRecords.slice(0, 120).map((record) => ({
+              Page: record.page,
+              Values: recordSummary(record.values),
+              "Source text": trim(record.source_text, 700),
+              Citation: record.citation,
+            }))}
+          />
+        </div>
+      )}
+
         {tables.length > 0 && (
           <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
-            <div style={{ fontWeight: 650, marginBottom: 8 }}>Extracted business tables</div>
+            <div style={{ fontWeight: 650, marginBottom: 8 }}>Extracted tables</div>
             <GenericRowsTable
               columns={["title", "page", "area", "row_count", "columns"]}
               rows={tables.slice(0, 30).map((table) => ({
@@ -1508,20 +1515,20 @@ function ExtractionJsonPreview({ runId, meta }) {
           </div>
         )}
 
-        {businessDocs.length > 0 && (
-          <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
-            <div style={{ fontWeight: 650, marginBottom: 8 }}>Business structure preview</div>
-            <BusinessStructurePreview documents={businessDocs} />
-          </div>
-        )}
-
-        <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
-          <div style={{ fontWeight: 650, marginBottom: 8 }}>JSON payload preview</div>
+      <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>Clean JSON preview</div>
           <pre className="dl-scrollbar" style={{ margin: 0, maxHeight: 360, overflow: "auto", background: "#fbfaf6", border: "1px solid #e0d8ca", borderRadius: 8, padding: 12, fontSize: 12, lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
-            {JSON.stringify(data, null, 2)}
+            {JSON.stringify(
+              {
+                document_summary: data.document_summary,
+                content: content.slice(0, 30),
+                tables: tables.slice(0, 10),
+              },
+              null,
+              2,
+            )}
           </pre>
         </div>
-      </div>
     </div>
   );
 }
@@ -3306,6 +3313,7 @@ async function fetchStructuredExtraction(runId) {
 
 function normalizeStructuredExtractionPayload(payload) {
   if (payload?.structured_json) return payload.structured_json;
+  if (payload?.document_summary || payload?.content || payload?.pages) return payload;
 
   const blocks = payload?.blocks || [];
   const tables = payload?.tables || [];
@@ -3351,16 +3359,28 @@ function normalizeStructuredExtractionPayload(payload) {
   });
 
   return {
-    run_id: payload?.run_id,
-    documents: payload?.documents || [],
-    summary: payload?.summary || {},
-    coverage: payload?.coverage,
+    document_summary: {
+      label: payload?.summary?.label || "Extracted document",
+      source_type: payload?.summary?.source_format || "document",
+      extraction_quality: {
+        grade: payload?.summary?.quality || "not rated",
+        coverage: payload?.coverage,
+      },
+    },
     semantic_fields: semanticFields.slice(0, 220),
     business_structure: buildBusinessStructureFromBlocks(blocks, tables, semanticFields),
     sections: blocks.filter((b) => ["section", "heading"].includes(b.type)).slice(0, 200),
     tables,
-    text_blocks: blocks.filter((b) => ["paragraph", "list_item", "kv_pair", "figure"].includes(b.type)).slice(0, 500),
-    ai_analysis: payload?.ai_analysis,
+    content: blocks
+      .filter((b) => ["paragraph", "list_item", "kv_pair", "figure", "section", "heading"].includes(b.type))
+      .map((block) => ({
+        page: block.page_number,
+        order: block.sequence || 0,
+        type: block.type,
+        path: block.path,
+        text: block.text || block.payload?.text || "",
+        citation: `p.${block.page_number || "-"} - ${block.path || "document"}`,
+      })),
   };
 }
 
@@ -3522,6 +3542,14 @@ function displayCell(value) {
   if (Array.isArray(value)) return value.map(displayCell).join(", ");
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function recordSummary(values) {
+  if (!values || typeof values !== "object") return "";
+  return Object.entries(values)
+    .filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== "")
+    .map(([key, value]) => `${key}: ${value}`)
+    .join(" | ");
 }
 
 function tableMinWidth(columnCount, min = 560, max = 1280) {
