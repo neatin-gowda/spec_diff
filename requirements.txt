@@ -18,3 +18,5 @@ pyxlsb==1.0.10
 xlrd==2.0.1
 arabic-reshaper==3.0.0
 python-bidi==0.6.6
+pillow==10.4.0
+pytesseract==0.3.13
