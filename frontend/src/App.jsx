@@ -731,7 +731,7 @@ function JobsDashboard({ onOpenJob, error }) {
         <EmptyState label="No jobs are available in this backend session yet." />
       ) : (
         <div className="dl-scrollbar" style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 860 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 980 }}>
             <thead>
               <tr style={{ background: "#1f2937", color: "white" }}>
                 <th style={th}>Workflow</th>
@@ -739,6 +739,7 @@ function JobsDashboard({ onOpenJob, error }) {
                 <th style={th}>Status</th>
                 <th style={th}>Progress</th>
                 <th style={th}>Pages</th>
+                <th style={th}>AI tokens</th>
                 <th style={th}>Action</th>
               </tr>
             </thead>
@@ -774,6 +775,9 @@ function JobsDashboard({ onOpenJob, error }) {
                       {job.kind === "extraction"
                         ? (job.n_pages || "-")
                         : `${job.n_pages_base || "-"} / ${job.n_pages_target || "-"}`}
+                    </td>
+                    <td style={td}>
+                      <AiUsageInline usage={job.ai_usage} />
                     </td>
                     <td style={td}>
                       <button
@@ -1077,6 +1081,9 @@ function StatsBar({ meta }) {
       <StatChip label="Unchanged" value={s.UNCHANGED || 0} />
       <StatChip label="Coverage" value={`${safePercent(meta.coverage?.base)} / ${safePercent(meta.coverage?.target)}`} />
       <StatChip label="Pages" value={`${meta.n_pages_base} / ${meta.n_pages_target}`} />
+      {Number(meta.ai_usage?.total_tokens || 0) > 0 && (
+        <StatChip label="AI tokens" value={`${formatInt(meta.ai_usage.total_tokens)} (${formatInt(meta.ai_usage.calls || 0)} calls)`} />
+      )}
     </section>
   );
 }
@@ -1096,6 +1103,45 @@ function StatChip({ label, value, tone }) {
       <span>{label}</span>
       <strong style={{ fontWeight: 650 }}>{value}</strong>
     </span>
+  );
+}
+
+function AiUsageInline({ usage }) {
+  const total = Number(usage?.total_tokens || 0);
+  const calls = Number(usage?.calls || 0);
+
+  if (!total) {
+    return <span style={{ color: "#98a2b3" }}>0</span>;
+  }
+
+  return (
+    <span title={`${formatInt(usage?.prompt_tokens || 0)} input, ${formatInt(usage?.completion_tokens || 0)} output`}>
+      {formatInt(total)} <span style={{ color: "#667085" }}>({formatInt(calls)} calls)</span>
+    </span>
+  );
+}
+
+function AiUsageCard({ usage }) {
+  const total = Number(usage?.total_tokens || 0);
+  if (!total) return null;
+
+  const operations = Array.isArray(usage?.operations) ? usage.operations : [];
+  const latestOps = operations.slice(-4);
+
+  return (
+    <div style={{ border: "1px solid #ded6c8", borderRadius: 8, padding: 10, marginBottom: 12, background: "#fbfaf6", fontSize: 12, color: "#475467" }}>
+      <strong style={{ color: "#344054" }}>AI usage:</strong>{" "}
+      {formatInt(total)} tokens · {formatInt(usage.calls || 0)} call(s) · {formatInt(usage.prompt_tokens || 0)} input / {formatInt(usage.completion_tokens || 0)} output
+      {latestOps.length > 0 && (
+        <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {latestOps.map((op, idx) => (
+            <span key={`${op.operation || "op"}-${idx}`} style={{ border: "1px solid #d8d0c3", borderRadius: 999, padding: "3px 7px", background: "#fffdf8" }}>
+              {op.operation || "AI call"} · {formatInt(op.total_tokens || 0)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1165,6 +1211,9 @@ function ExtractionStats({ meta }) {
       <StatChip label="Tables" value={summary.table_count || 0} />
       <StatChip label="Blocks" value={Object.values(summary.block_counts || {}).reduce((a, b) => a + Number(b || 0), 0)} />
       <StatChip label="Pages" value={meta.n_pages || meta.native_pages || 0} />
+      {Number(meta.ai_usage?.total_tokens || 0) > 0 && (
+        <StatChip label="AI tokens" value={`${formatInt(meta.ai_usage.total_tokens)} (${formatInt(meta.ai_usage.calls || 0)} calls)`} />
+      )}
     </section>
   );
 }
@@ -1257,6 +1306,8 @@ function ExtractionOverview({ runId, meta }) {
           )}
         </div>
       )}
+
+      <AiUsageCard usage={meta.ai_usage} />
     </div>
   );
 }
@@ -2334,6 +2385,8 @@ function QueryPanel({ runId }) {
         </div>
       )}
 
+      {response?.usage && <AiUsageCard usage={response.usage} />}
+
       {response && rows.length === 0 && <EmptyState label="No supporting results were found." />}
 
       {rows.length > 0 && columns.length > 0 ? (
@@ -2976,6 +3029,7 @@ function TableColumnCompareResult({ diff }) {
               {Array.isArray(diff.ai_review.rows) && diff.ai_review.rows.length > 0 && (
                 <GenericRowsTable columns={diff.ai_review.columns?.length ? diff.ai_review.columns : inferColumns(diff.ai_review.rows)} rows={diff.ai_review.rows} />
               )}
+              <AiUsageCard usage={diff.ai_review.usage} />
             </>
           ) : (
             <div style={{ color: COLORS.DELETED.text }}>{diff.ai_review.error || "AI review was not generated."}</div>
@@ -3479,6 +3533,12 @@ function trim(value, limit) {
   if (!value) return "";
   const text = String(value).replace(/\s+/g, " ").trim();
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}...`;
+}
+
+function formatInt(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return "0";
+  return Math.round(n).toLocaleString();
 }
 
 function unique(values) {
