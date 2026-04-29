@@ -771,6 +771,157 @@ def _structured_extraction_json(r: dict, run_id: str) -> dict[str, Any]:
     }
 
 
+def _business_table_for_json(table: dict[str, Any]) -> dict[str, Any]:
+    columns = [str(col or "").strip() for col in table.get("columns", []) if str(col or "").strip()]
+    rows = []
+    for row in table.get("rows") or table.get("row_preview") or []:
+        values = row.get("values") if isinstance(row, dict) else {}
+        rows.append(
+            {
+                "row": row.get("row_key") or row.get("definition") or f"Row {len(rows) + 1}",
+                "values": {
+                    str(col): values.get(col)
+                    for col in columns
+                    if str(values.get(col, "")).strip()
+                },
+                "citation": row.get("citation") or table.get("page_label"),
+            }
+        )
+
+    return {
+        "title": table.get("title") or table.get("display_name") or "Detected table",
+        "page": table.get("page_label") or f"Page {table.get('page_first') or '-'}",
+        "area": table.get("area") or table.get("context") or "Document",
+        "columns": columns,
+        "row_count": table.get("n_rows") or len(rows),
+        "rows": rows,
+        "notes": [
+            str(w)
+            for w in (table.get("quality_warnings") or [])
+            if str(w or "").strip()
+        ][:5],
+    }
+
+
+def _business_extraction_json(r: dict, run_id: str) -> dict[str, Any]:
+    """
+    User-facing extraction JSON.
+
+    This intentionally excludes run IDs, backend payloads, bboxes, fingerprints,
+    and processing metadata. It keeps only business content plus page references.
+    """
+    raw = _structured_extraction_json(r, run_id)
+    blocks = r.get("blocks", [])
+    fields = raw.get("semantic_fields") or []
+    tables = [_business_table_for_json(table) for table in raw.get("tables", [])]
+
+    pages: dict[int, dict[str, Any]] = {}
+    for block in sorted(blocks, key=lambda b: (b.page_number or 1, b.sequence or 0)):
+        if block.block_type.value == "table_row":
+            continue
+
+        page_no = int(block.page_number or 1)
+        page = pages.setdefault(
+            page_no,
+            {
+                "page": page_no,
+                "citation": f"p.{page_no}",
+                "content": [],
+                "fields": [],
+                "tables": [],
+            },
+        )
+
+        if block.block_type.value == "table":
+            matching = [
+                table for table in tables
+                if table.get("page") == (f"Page {page_no}") or table.get("page", "").startswith(f"Pages {page_no}-")
+            ]
+            page["tables"].extend(matching[:1])
+            continue
+
+        text = re.sub(r"\s+", " ", str(block.text or "")).strip()
+        if not text:
+            continue
+
+        item = {
+            "type": block.block_type.value,
+            "text": text,
+            "citation": f"p.{page_no} - {_path_label(block.path)}",
+        }
+        extracted_fields = _extract_text_fields(text, page_no, block.path, block.block_type.value)
+        if extracted_fields:
+            item["fields"] = [
+                {
+                    "field": field.get("field"),
+                    "value": field.get("value"),
+                    "citation": field.get("citation"),
+                }
+                for field in extracted_fields
+            ]
+            page["fields"].extend(item["fields"])
+        page["content"].append(item)
+
+    business_structure = raw.get("business_structure") or {"documents": [], "section_count": 0}
+    quality = (raw.get("intelligence") or {}).get("quality") or {}
+    template = (raw.get("intelligence") or {}).get("template") or {}
+    summary = r.get("summary") or {}
+
+    result = {
+        "document_summary": {
+            "label": r.get("label"),
+            "source_type": r.get("source_format"),
+            "page_count": len(r.get("page_imgs", [])) or r.get("native_pages"),
+            "detected_template": template.get("template_type") or "generic_document",
+            "detected_language": (template.get("language") or {}).get("script"),
+            "extraction_quality": {
+                "grade": quality.get("grade") or summary.get("quality"),
+                "score": quality.get("score"),
+                "coverage": r.get("coverage"),
+                "warnings": [
+                    warning.get("message") if isinstance(warning, dict) else str(warning)
+                    for warning in (quality.get("warnings") or [])
+                ][:8],
+            },
+            "counts": {
+                "fields": len(fields),
+                "tables": len(tables),
+                "sections": len(raw.get("sections") or []),
+                "pages": len(pages),
+            },
+        },
+        "business_structure": business_structure,
+        "pages": [pages[key] for key in sorted(pages)],
+        "fields": [
+            {
+                "field": field.get("field"),
+                "value": field.get("value"),
+                "page": field.get("page"),
+                "source": field.get("source"),
+                "citation": field.get("citation"),
+            }
+            for field in fields
+        ],
+        "tables": tables,
+        "sections": [
+            {
+                "title": section.get("title"),
+                "page": section.get("page"),
+                "text": section.get("text"),
+                "citation": f"p.{section.get('page')}",
+            }
+            for section in (raw.get("sections") or [])
+        ],
+    }
+
+    if r.get("ai_analysis"):
+        result["ai_analysis"] = r.get("ai_analysis")
+
+    # Backward-compatible aliases for the current UI tabs.
+    result["semantic_fields"] = result["fields"]
+    return result
+
+
 def _curated_extraction_context(blocks: list[Block], limit_chars: int = 42000) -> str:
     parts = []
     used = 0
@@ -1443,25 +1594,9 @@ def get_extract_images(run_id: str):
 @app.get("/extract-runs/{run_id}/json")
 def download_extract_json(run_id: str):
     r = _ensure_extraction_complete(run_id)
-    blocks = r.get("blocks", [])
-    tables = [
-        _table_matrix(block, blocks, include_rows=True)
-        for block in blocks
-        if block.block_type.value == "table"
-    ]
-    payload = {
-        "run_id": run_id,
-        "label": r.get("label"),
-        "source_format": r.get("source_format"),
-        "documents": r.get("documents", []),
-        "coverage": r.get("coverage"),
-        "summary": r.get("summary", {}),
-        "ai_analysis": r.get("ai_analysis"),
-        "structured_json": _structured_extraction_json(r, run_id),
-        "blocks": [_block_record(block, include_payload=True) for block in blocks],
-        "tables": tables,
-    }
-    filename = f"document_extraction_{run_id}.json"
+    payload = _business_extraction_json(r, run_id)
+    safe_label = re.sub(r"[^A-Za-z0-9]+", "_", str(r.get("label") or "document")).strip("_").lower() or "document"
+    filename = f"{safe_label}_business_extraction.json"
     return Response(
         content=json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         media_type="application/json",
@@ -1472,7 +1607,7 @@ def download_extract_json(run_id: str):
 @app.get("/extract-runs/{run_id}/structured-json")
 def get_extract_structured_json(run_id: str):
     r = _ensure_extraction_complete(run_id)
-    return _structured_extraction_json(r, run_id)
+    return _business_extraction_json(r, run_id)
 
 
 @app.get("/runs/{run_id}")
