@@ -13,6 +13,7 @@ import os
 import re
 from typing import Any
 
+from .ai_usage import usage_from_response
 from .models import Block, BlockDiff, ChangeType, SummaryRow
 
 
@@ -411,7 +412,7 @@ def _select_evidence(diffs: list[BlockDiff], base_blocks: list[Block], target_bl
     return [row for _, row in scored[:limit]]
 
 
-def _call_llm(prompt: str) -> str:
+def _call_llm(prompt: str, usage_callback=None) -> str:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deploy = os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
@@ -435,6 +436,8 @@ def _call_llm(prompt: str) -> str:
         max_tokens=2400,
         response_format={"type": "json_object"},
     )
+    if usage_callback:
+        usage_callback(usage_from_response(resp, operation="comparison_ai_summary", model=deploy))
     return resp.choices[0].message.content or '{"rows":[]}'
 
 
@@ -443,6 +446,7 @@ def summarize(
     base_blocks: list[Block],
     target_blocks: list[Block],
     use_llm: bool = True,
+    usage_callback=None,
 ) -> list[SummaryRow]:
     evidence = _select_evidence(diffs, base_blocks, target_blocks)
 
@@ -451,7 +455,7 @@ def summarize(
             prompt = GENERIC_SUMMARY_PROMPT.format(
                 evidence_json=json.dumps(evidence[:120], ensure_ascii=False, indent=2, default=str)
             )
-            raw = _call_llm(prompt)
+            raw = _call_llm(prompt, usage_callback=usage_callback)
             data = json.loads(raw)
             rows = data.get("rows") if isinstance(data, dict) else data
             if isinstance(rows, list):
