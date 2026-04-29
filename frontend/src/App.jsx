@@ -7,6 +7,8 @@ const BRAND = {
   subtitle: "Document comparison with semantic review, visual evidence, citations, and reports.",
 };
 
+const FILE_ACCEPT = ".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.doc,.docx,.xls,.xlsx,.xlsm,.xlsb,.csv,.tsv";
+
 const COLORS = {
   ADDED: { bg: "rgba(31,160,70,.16)", border: "#1e8a47", text: "#176c38", chip: "#eef8f1" },
   DELETED: { bg: "rgba(218,54,54,.14)", border: "#bb3030", text: "#9f2525", chip: "#fff2f2" },
@@ -226,6 +228,7 @@ export default function App() {
   const [extractBusy, setExtractBusy] = useState(false);
   const [extractError, setExtractError] = useState("");
   const [extractTab, setExtractTab] = useState("overview");
+  const [jobError, setJobError] = useState("");
 
   const resetAll = () => {
     setWorkspace("home");
@@ -249,6 +252,7 @@ export default function App() {
       setWorkspace(nextWorkspace);
       setError("");
       setExtractError("");
+      setJobError("");
     }
 
     if (typeof window !== "undefined" && window.history?.pushState) {
@@ -389,6 +393,7 @@ export default function App() {
       const data = await resp.json();
 
       setRunId(data.run_id);
+      setBusy(false);
       setMeta({
         run_id: data.run_id,
         status: data.status,
@@ -399,6 +404,7 @@ export default function App() {
         n_pages_base: 0,
         n_pages_target: 0,
       });
+      setWorkspace("jobs");
     } catch (err) {
       setBusy(false);
       setError(friendlyFetchError(err));
@@ -434,6 +440,7 @@ export default function App() {
 
       const data = await resp.json();
       setExtractRunId(data.run_id);
+      setExtractBusy(false);
       setExtractMeta({
         run_id: data.run_id,
         status: data.status,
@@ -441,9 +448,39 @@ export default function App() {
         progress: data.progress || 5,
         summary: {},
       });
+      setWorkspace("jobs");
     } catch (err) {
       setExtractBusy(false);
       setExtractError(friendlyFetchError(err));
+    }
+  };
+
+  const openJob = async (job) => {
+    setJobError("");
+    try {
+      if (job.kind === "extraction") {
+        const resp = await fetch(`${API}/extract-runs/${job.run_id}`);
+        if (!resp.ok) throw new Error(await readResponseError(resp));
+        const data = await resp.json();
+        setExtractRunId(job.run_id);
+        setExtractMeta(data);
+        setExtractBusy(data.status !== "complete" && data.status !== "failed");
+        setExtractTab("overview");
+        setWorkspace("extract");
+        return;
+      }
+
+      const resp = await fetch(`${API}/runs/${job.run_id}`);
+      if (!resp.ok) throw new Error(await readResponseError(resp));
+      const data = await resp.json();
+      setRunId(job.run_id);
+      setMeta(data);
+      setBusy(data.status !== "complete" && data.status !== "failed");
+      setTab("viewer");
+      setPageNum(1);
+      setWorkspace("compare");
+    } catch (err) {
+      setJobError(friendlyFetchError(err));
     }
   };
 
@@ -459,17 +496,23 @@ export default function App() {
       <style>{css}</style>
       <div style={pageStyle}>
         <Header
-          runId={isComplete ? runId : null}
+          runId={workspace === "compare" && isComplete ? runId : null}
           workspace={workspace}
           onStartOver={() => goWorkspace("home")}
+          onJobs={() => goWorkspace("jobs")}
           onDownloadReport={downloadReport}
         />
 
-        {workspace === "home" && !isComplete && !isExtractComplete && (
+        {workspace === "home" && (
           <LandingPage
             onExtract={() => goWorkspace("extract")}
             onCompare={() => goWorkspace("compare")}
+            onJobs={() => goWorkspace("jobs")}
           />
+        )}
+
+        {workspace === "jobs" && (
+          <JobsDashboard onOpenJob={openJob} error={jobError} />
         )}
 
         {workspace === "compare" && !isComplete && (
@@ -500,7 +543,7 @@ export default function App() {
           </section>
         )}
 
-        {isComplete && runId && meta && (
+        {workspace === "compare" && isComplete && runId && meta && (
           <>
             <StatsBar meta={meta} />
             <Tabs tab={tab} setTab={setTab} />
@@ -514,7 +557,7 @@ export default function App() {
           </>
         )}
 
-        {isExtractComplete && extractRunId && extractMeta && (
+        {workspace === "extract" && isExtractComplete && extractRunId && extractMeta && (
           <ExtractionWorkspace
             runId={extractRunId}
             meta={extractMeta}
@@ -527,7 +570,7 @@ export default function App() {
   );
 }
 
-function Header({ runId, workspace, onStartOver, onDownloadReport }) {
+function Header({ runId, workspace, onStartOver, onJobs, onDownloadReport }) {
   return (
     <header style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
@@ -562,6 +605,11 @@ function Header({ runId, workspace, onStartOver, onDownloadReport }) {
                 Export PDF report
               </button>
             )}
+            {workspace !== "jobs" && (
+              <button onClick={onJobs} style={secondaryButtonStyle()}>
+                Job status
+              </button>
+            )}
             <button onClick={onStartOver} style={secondaryButtonStyle()}>
               New workflow
             </button>
@@ -572,7 +620,7 @@ function Header({ runId, workspace, onStartOver, onDownloadReport }) {
   );
 }
 
-function LandingPage({ onExtract, onCompare }) {
+function LandingPage({ onExtract, onCompare, onJobs }) {
   return (
     <section style={{ ...panelStyle, padding: 22 }}>
       <div style={{ marginBottom: 18 }}>
@@ -582,7 +630,7 @@ function LandingPage({ onExtract, onCompare }) {
         </p>
       </div>
 
-      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+      <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 14 }}>
         <WorkspaceCard
           title="Extract documents"
           description="Upload PDFs, images, Word files, spreadsheets, xlsb workbooks, CSV, or TSV and review extracted text, tables, image/OCR content, coverage, JSON, and optional AI analysis."
@@ -594,6 +642,12 @@ function LandingPage({ onExtract, onCompare }) {
           description="Upload baseline and revised files, then use the existing side-by-side review, semantic diff, table workspace, Ask Agent, and reports."
           action="Start comparison"
           onClick={onCompare}
+        />
+        <WorkspaceCard
+          title="Job status"
+          description="Review queued, running, completed, or failed extraction and comparison jobs without blocking the upload page."
+          action="Open jobs"
+          onClick={onJobs}
         />
       </div>
     </section>
@@ -619,6 +673,126 @@ function WorkspaceCard({ title, description, action, onClick }) {
       <div style={{ color: "#667085", fontSize: 14, lineHeight: 1.45, minHeight: 62 }}>{description}</div>
       <div style={{ marginTop: 16, color: "#2f5f4f", fontWeight: 650 }}>{action}</div>
     </button>
+  );
+}
+
+function JobsDashboard({ onOpenJob, error }) {
+  const [state, setState] = useState({ loading: true, error: "", jobs: [] });
+
+  const loadJobs = async () => {
+    try {
+      const resp = await fetch(`${API}/jobs?limit=80`);
+      if (!resp.ok) throw new Error(await readResponseError(resp));
+      const data = await resp.json();
+      setState({ loading: false, error: "", jobs: data.jobs || [] });
+    } catch (err) {
+      setState({ loading: false, error: friendlyFetchError(err), jobs: [] });
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+
+    const poll = async () => {
+      if (cancelled) return;
+      await loadJobs();
+      if (!cancelled) timer = setTimeout(poll, 1800);
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  const jobs = state.jobs || [];
+
+  return (
+    <section style={{ ...panelStyle, padding: 18 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Job status</h2>
+          <p style={{ margin: "5px 0 0", color: "#667085", fontSize: 13 }}>
+            Uploads start a background job. You can start another workflow and return here to open completed results.
+          </p>
+        </div>
+        <button type="button" onClick={loadJobs} style={secondaryButtonStyle()}>
+          Refresh
+        </button>
+      </div>
+
+      {error && <ErrorBox message={error} />}
+      {state.error && <ErrorBox message={state.error} />}
+      {state.loading && !jobs.length ? (
+        <SoftLoading label="Loading jobs" />
+      ) : jobs.length === 0 ? (
+        <EmptyState label="No jobs are available in this backend session yet." />
+      ) : (
+        <div className="dl-scrollbar" style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 860 }}>
+            <thead>
+              <tr style={{ background: "#1f2937", color: "white" }}>
+                <th style={th}>Workflow</th>
+                <th style={th}>Documents</th>
+                <th style={th}>Status</th>
+                <th style={th}>Progress</th>
+                <th style={th}>Pages</th>
+                <th style={th}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.map((job) => {
+                const complete = job.status === "complete";
+                const failed = job.status === "failed";
+                return (
+                  <tr key={job.run_id}>
+                    <td style={td}>
+                      <strong style={{ fontWeight: 650 }}>{job.kind === "extraction" ? "Extraction" : "Comparison"}</strong>
+                      <div style={{ color: "#667085", marginTop: 4 }}>{trim(job.run_id, 18)}</div>
+                    </td>
+                    <td style={td}>
+                      {job.kind === "extraction" ? (
+                        <div>{job.label || "Uploaded document"}</div>
+                      ) : (
+                        <div>{job.base_label || "Baseline"} → {job.target_label || "Revised"}</div>
+                      )}
+                      <div style={{ color: "#667085", marginTop: 4 }}>
+                        {[job.source_format, job.base_format, job.target_format].filter(Boolean).join(" / ")}
+                      </div>
+                    </td>
+                    <td style={td}>
+                      <JobStatusBadge status={job.status} />
+                      {job.status_message && <div style={{ color: "#667085", marginTop: 5 }}>{job.status_message}</div>}
+                      {failed && job.error && <div style={{ color: COLORS.DELETED.text, marginTop: 5 }}>{trim(job.error, 160)}</div>}
+                    </td>
+                    <td style={td}>
+                      <ProgressMini value={job.progress || 0} failed={failed} />
+                    </td>
+                    <td style={td}>
+                      {job.kind === "extraction"
+                        ? (job.n_pages || "-")
+                        : `${job.n_pages_base || "-"} / ${job.n_pages_target || "-"}`}
+                    </td>
+                    <td style={td}>
+                      <button
+                        type="button"
+                        onClick={() => onOpenJob(job)}
+                        disabled={!complete}
+                        style={complete ? primaryButtonStyle(false, { height: 36 }) : secondaryButtonStyle({ height: 36, opacity: 0.55, cursor: "default" })}
+                      >
+                        {complete ? "Open result" : failed ? "Failed" : "Processing"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -783,7 +957,7 @@ function FileInput({ label, helper, name, disabled, multiple = false }) {
         ref={inputRef}
         type="file"
         name={name}
-        accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.doc,.docx,.xls,.xlsx,.xlsm,.xlsb,.csv,.tsv,application/pdf,image/png,image/jpeg,image/tiff,image/bmp,image/webp,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.ms-excel.sheet.binary.macroEnabled.12,text/csv,text/tab-separated-values"
+        accept={FILE_ACCEPT}
         multiple={multiple}
         required
         disabled={disabled}
@@ -1204,10 +1378,10 @@ function ExtractionJsonPreview({ runId, meta }) {
   const data = state.data || {};
   const fields = data.semantic_fields || [];
   const tables = data.tables || [];
+  const pages = data.pages || [];
   const businessDocs = data.business_structure?.documents || [];
-  const intelligence = data.intelligence || data.summary?.intelligence || {};
-  const quality = intelligence.quality || {};
-  const template = intelligence.template || {};
+  const documentSummary = data.document_summary || {};
+  const quality = documentSummary.extraction_quality || {};
 
   return (
     <div className="two-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, .95fr) minmax(0, 1.05fr)", gap: 14, alignItems: "start" }}>
@@ -1228,12 +1402,14 @@ function ExtractionJsonPreview({ runId, meta }) {
 
       <div style={{ minWidth: 0, display: "grid", gap: 12 }}>
         <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
-          <div style={{ fontWeight: 650, marginBottom: 8 }}>Extraction intelligence</div>
+          <div style={{ fontWeight: 650, marginBottom: 8 }}>Business extraction summary</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", color: "#344054", fontSize: 13 }}>
-            <span style={softPillStyle}>Template: {template.template_type || "generic document"}</span>
+            <span style={softPillStyle}>Document: {documentSummary.label || meta.label || "uploaded file"}</span>
+            <span style={softPillStyle}>Type: {documentSummary.source_type || meta.source_format || "document"}</span>
+            <span style={softPillStyle}>Template: {documentSummary.detected_template || "generic document"}</span>
             <span style={softPillStyle}>Quality: {quality.grade || "not rated"}</span>
             {Number.isFinite(quality.score) && <span style={softPillStyle}>Score: {Math.round(quality.score * 100)}%</span>}
-            {template.language?.script && <span style={softPillStyle}>Script: {template.language.script}</span>}
+            {documentSummary.detected_language && <span style={softPillStyle}>Script: {documentSummary.detected_language}</span>}
           </div>
           {Array.isArray(quality.warnings) && quality.warnings.length > 0 && (
             <div style={{ color: "#8a5a00", fontSize: 13, marginTop: 8, lineHeight: 1.4 }}>
@@ -1242,12 +1418,12 @@ function ExtractionJsonPreview({ runId, meta }) {
           )}
         </div>
 
-        <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+	      <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 8 }}>
             <div>
               <div style={{ fontWeight: 650 }}>Readable extraction JSON</div>
               <div style={{ color: "#667085", fontSize: 13, marginTop: 3 }}>
-                {fields.length} semantic field(s), {tables.length} table(s), {data.sections?.length || 0} section(s)
+	                {fields.length} field(s), {tables.length} table(s), {data.sections?.length || 0} section(s), {pages.length} page block(s)
               </div>
             </div>
             <button onClick={() => { window.location.href = `${API}/extract-runs/${runId}/json`; }} style={secondaryButtonStyle()}>
@@ -1264,6 +1440,22 @@ function ExtractionJsonPreview({ runId, meta }) {
             <EmptyState label="No key-value fields were detected. Check extracted tables and text blocks." />
           )}
         </div>
+
+        {tables.length > 0 && (
+          <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
+            <div style={{ fontWeight: 650, marginBottom: 8 }}>Extracted business tables</div>
+            <GenericRowsTable
+              columns={["title", "page", "area", "row_count", "columns"]}
+              rows={tables.slice(0, 30).map((table) => ({
+                title: table.title,
+                page: table.page,
+                area: table.area,
+                row_count: table.row_count,
+                columns: (table.columns || []).join(" | "),
+              }))}
+            />
+          </div>
+        )}
 
         {businessDocs.length > 0 && (
           <div style={{ ...panelStyle, padding: 12, boxShadow: "none" }}>
@@ -2278,7 +2470,7 @@ function TablesWorkspace({ runId }) {
     rowFilter,
   ]);
 
-  const tableComparePayload = () => ({
+  const tableComparePayload = (overrides = {}) => ({
     base_table_id: baseTableId,
     target_table_id: targetTableId,
     base_row_columns: baseRowColumns,
@@ -2286,12 +2478,12 @@ function TablesWorkspace({ runId }) {
     base_value_columns: baseValueColumns.filter((c) => !baseRowColumns.includes(c)),
     target_value_columns: targetValueColumns.filter((c) => !targetRowColumns.includes(c)),
     row_filter: rowFilter.trim() || null,
-    use_ai: useTableAi,
+    use_ai: overrides.use_ai ?? useTableAi,
     question: tableQuestion.trim() || null,
     limit: 200,
   });
 
-  const compare = async () => {
+  const compare = async (overrides = {}) => {
     if (!baseTableId || !targetTableId) return;
 
     setCompareBusy(true);
@@ -2302,7 +2494,7 @@ function TablesWorkspace({ runId }) {
       const r = await fetch(`${API}/runs/${runId}/compare-table-columns`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(tableComparePayload()),
+        body: JSON.stringify(tableComparePayload(overrides)),
       });
 
       if (!r.ok) throw new Error(await readResponseError(r));
@@ -2404,19 +2596,32 @@ function TablesWorkspace({ runId }) {
       </div>
 
       <div style={{ background: "#fbfaf6", border: "1px solid #ded6c8", borderRadius: 8, padding: 12, marginBottom: 14 }}>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 650, color: "#344054", marginBottom: 8 }}>
-          <input
-            type="checkbox"
-            checked={useTableAi}
-            onChange={(e) => setUseTableAi(e.target.checked)}
-          />
-          Use AI for selected table insight
-        </label>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 650, color: "#344054" }}>
+            <input
+              type="checkbox"
+              checked={useTableAi}
+              onChange={(e) => setUseTableAi(e.target.checked)}
+            />
+            Include AI insight for this selected table slice
+          </label>
+          <button
+            type="button"
+            onClick={() => {
+              setUseTableAi(true);
+              compare({ use_ai: true });
+            }}
+            disabled={compareBusy || !baseTableId || !targetTableId}
+            style={secondaryButtonStyle(compareBusy || !baseTableId || !targetTableId ? { height: 36, opacity: 0.65, cursor: "default" } : { height: 36 })}
+          >
+            {compareBusy ? "Running" : "Run table AI insight"}
+          </button>
+        </div>
         <input
           value={tableQuestion}
           onChange={(e) => setTableQuestion(e.target.value)}
           disabled={!useTableAi}
-          placeholder="Ask what to review in the selected table slice"
+          placeholder="Example: summarize changed values, renamed headers, missing rows, and review questions"
           style={{
             ...inputStyle,
             opacity: useTableAi ? 1 : 0.65,
@@ -2424,7 +2629,7 @@ function TablesWorkspace({ runId }) {
           }}
         />
         <div style={{ color: "#667085", fontSize: 12, marginTop: 6 }}>
-          AI receives only the selected table metadata, selected columns, aligned rows, and detected cell/header changes.
+          AI is optional and receives only the selected table metadata, selected columns, aligned rows, and detected cell/header changes.
         </div>
       </div>
 
@@ -2442,7 +2647,7 @@ function TablesWorkspace({ runId }) {
           </div>
         </div>
         <button
-          onClick={compare}
+          onClick={() => compare()}
           disabled={compareBusy || !baseTableId || !targetTableId}
           style={primaryButtonStyle(compareBusy || !baseTableId || !targetTableId, { height: 40 })}
         >
@@ -2982,6 +3187,32 @@ function Confidence({ value }) {
   const pct = Math.round(value * 100);
   const color = pct >= 80 ? COLORS.ADDED.text : pct >= 65 ? COLORS.MODIFIED.text : COLORS.DELETED.text;
   return <span style={{ color, fontWeight: 650 }}>{pct}%</span>;
+}
+
+function JobStatusBadge({ status }) {
+  const value = String(status || "queued").toLowerCase();
+  const tone =
+    value === "complete" ? COLORS.ADDED :
+    value === "failed" ? COLORS.DELETED :
+    value === "running" ? COLORS.MODIFIED :
+    COLORS.UNCHANGED;
+  return (
+    <span style={{ display: "inline-block", background: tone.chip, color: tone.text, border: `1px solid ${tone.border}`, padding: "2px 8px", borderRadius: 999, fontWeight: 650, fontSize: 12 }}>
+      {value}
+    </span>
+  );
+}
+
+function ProgressMini({ value, failed = false }) {
+  const pct = Math.max(0, Math.min(100, Number(value) || 0));
+  return (
+    <div>
+      <div className="progress-track" style={{ height: 6, minWidth: 140 }}>
+        <div className={`progress-fill ${failed ? "failed" : ""}`} style={{ width: `${failed ? 100 : pct}%` }} />
+      </div>
+      <div style={{ marginTop: 5, color: "#667085", fontSize: 12 }}>{failed ? "failed" : `${pct}%`}</div>
+    </div>
+  );
 }
 
 async function readResponseError(resp) {
